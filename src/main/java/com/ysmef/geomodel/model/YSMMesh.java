@@ -1,6 +1,7 @@
 package com.ysmef.geomodel.model;
 
 import com.mojang.blaze3d.vertex.PoseStack;
+import com.ysmef.geomodel.YSMGeoCompat;
 import com.ysmef.geomodel.model.runtime.YSMRuntimeBridge;
 import net.minecraft.client.renderer.MultiBufferSource;
 import net.minecraft.client.renderer.RenderType;
@@ -10,8 +11,10 @@ import yesman.epicfight.api.model.Armature;
 import yesman.epicfight.api.utils.math.OpenMatrix4f;
 import yesman.epicfight.client.mesh.HumanoidMesh;
 import yesman.epicfight.client.renderer.EpicFightRenderTypes;
+import yesman.epicfight.client.renderer.shader.compute.ComputeShaderSetup;
 
 import javax.annotation.Nullable;
+import java.lang.reflect.Field;
 import java.util.*;
 
 /**
@@ -108,9 +111,67 @@ public class YSMMesh extends HumanoidMesh {
             RenderType finalRenderType = texture != null
                     ? EpicFightRenderTypes.replaceTexture(texture, renderType)
                     : renderType;
-            super.draw(poseStack, bufferSources, finalRenderType, drawingFunction, packedLight, r, g, b, a, overlay, armature, poses);
+            if (!tryDrawWithComputeShader(poseStack, bufferSources, finalRenderType, packedLight,
+                    r, g, b, a, overlay, armature, poses)) {
+                super.draw(poseStack, bufferSources, finalRenderType, drawingFunction, packedLight, r, g, b, a, overlay, armature, poses);
+            }
         } finally {
             YSMRuntimeBridge.clearCurrentEntity();
+        }
+    }
+
+    /**
+     * Epic Fight's CPU skinning path (ClientConfig.activateComputeShader = false,
+     * the default) renders converted meshes with missing faces, while the compute
+     * shader path is correct. Epic Fight creates its ComputeShaderSetup in the
+     * SkinnedMesh constructor whenever the GPU supports compute shaders, so this
+     * forces the compute path for our meshes regardless of the config; it falls
+     * back to the CPU path with a one-time warning when no setup is available.
+     */
+    private static final Field COMPUTE_SETUP_FIELD = findComputeSetupField();
+
+    private static volatile boolean computeFallbackWarned = false;
+
+    private static Field findComputeSetupField() {
+        try {
+            Field field = SkinnedMesh.class.getDeclaredField("computerShaderSetup");
+            field.setAccessible(true);
+            return field;
+        } catch (NoSuchFieldException e) {
+            YSMGeoCompat.LOGGER.error(
+                    "YSM-GEO Compat: Epic Fight's compute shader setup field not found; falling back to CPU skinning (converted meshes may show missing faces)", e);
+            return null;
+        }
+    }
+
+    private boolean tryDrawWithComputeShader(PoseStack poseStack, MultiBufferSource bufferSources, RenderType renderType,
+                                             int packedLight, float r, float g, float b, float a,
+                                             int overlay, @Nullable Armature armature, OpenMatrix4f[] poses) {
+        if (poses == null || armature == null || COMPUTE_SETUP_FIELD == null) {
+            warnComputeShaderUnavailableOnce();
+            return false;
+        }
+        try {
+            ComputeShaderSetup setup = (ComputeShaderSetup) COMPUTE_SETUP_FIELD.get(this);
+            if (setup == null) {
+                warnComputeShaderUnavailableOnce();
+                return false;
+            }
+            setup.drawWithShader(this, poseStack, bufferSources,
+                    EpicFightRenderTypes.getTriangulated(renderType),
+                    packedLight, r, g, b, a, overlay, armature, poses);
+            return true;
+        } catch (IllegalAccessException e) {
+            YSMGeoCompat.LOGGER.error("YSM-GEO Compat: failed to access Epic Fight compute shader setup, falling back to CPU skinning", e);
+            return false;
+        }
+    }
+
+    private static void warnComputeShaderUnavailableOnce() {
+        if (!computeFallbackWarned) {
+            computeFallbackWarned = true;
+            YSMGeoCompat.LOGGER.warn(
+                    "YSM-GEO Compat: Epic Fight compute shader skinning unavailable, falling back to the CPU skinning path (converted meshes may render with missing faces)");
         }
     }
 }
