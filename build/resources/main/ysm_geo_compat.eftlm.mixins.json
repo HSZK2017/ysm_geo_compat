@@ -1,0 +1,13 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "com.ysmef.geomodel.mixin.eftlm",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "ysm_geo_compat.refmap.json",
+  "client": [
+    "YsmMaidRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

@@ -1,0 +1,46 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+[[mods]]
+modId="ysm_geo_compat"
+version="1.0.0"
+displayName="YSM GEO Compat"
+description = '''
+Bridges YSM-format and Touhou Little Maid GEO models into the Epic Fight combat animation system, without requiring the YSM mod.
+
+Converts GEO models (YSM model packages from config/yes_steve_model and TLM model packs from tlm_custom_pack) into Epic Fight SkinnedMesh at runtime, enabling custom models to use Epic Fight combat animations seamlessly.
+
+Gameplay:
+- Combat mode: Epic Fight renders the model using combat animations
+- Idle mode: the original renderer draws the model as normal
+'''
+[[dependencies.ysm_geo_compat]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="BOTH"
+[[dependencies.ysm_geo_compat]]
+modId="minecraft"
+mandatory=true
+versionRange="[1.20.1,1.21)"
+ordering="NONE"
+side="BOTH"
+[[dependencies.ysm_geo_compat]]
+modId="epicfight"
+mandatory=true
+versionRange="[20.14,)"
+ordering="AFTER"
+side="BOTH"
+[[dependencies.ysm_geo_compat]]
+modId="touhou_little_maid"
+mandatory=false
+versionRange="[1.5,)"
+ordering="AFTER"
+side="BOTH"
+[[dependencies.ysm_geo_compat]]
+modId="ef_tlm"
+mandatory=false
+versionRange="[1.1,)"
+ordering="AFTER"
+side="BOTH"
