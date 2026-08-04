@@ -77,7 +77,7 @@ public class EFMeshJsonWriter {
         if (quads < 0) {
             return -1;
         }
-        writeRuntimeJson(pkg, geoModel, runtimeFile);
+        writeRuntimeJson(geoModel, pkg.scriptAnims, runtimeFile);
         return quads;
     }
 
@@ -165,9 +165,11 @@ public class EFMeshJsonWriter {
     /**
      * Writes the runtime script JSON consumed by YSMRuntimeModel: the bone table
      * (hierarchy, bind transforms, EF joint binding) plus the molang animations that
-     * drive YSM's model-changing behavior.
+     * drive the model's variant behavior. Used for YSM packages as well as TLM
+     * model-pack models that ship bedrock animation files.
      */
-    private static void writeRuntimeJson(YsmModelPackage pkg, YSMGeoModel geoModel, Path runtimeFile) throws IOException {
+    public static void writeRuntimeJson(YSMGeoModel geoModel, Map<String, com.ysmef.geomodel.ysm.script.ScriptAnim> scriptAnims,
+                                        Path runtimeFile) throws IOException {
         JsonObject root = new JsonObject();
 
         JsonArray bones = new JsonArray();
@@ -191,7 +193,7 @@ public class EFMeshJsonWriter {
         }
         root.add("bones", bones);
 
-        root.add("animations", com.ysmef.geomodel.ysm.script.ScriptJson.animationsToJson(pkg.scriptAnims));
+        root.add("animations", com.ysmef.geomodel.ysm.script.ScriptJson.animationsToJson(scriptAnims));
 
         Files.createDirectories(runtimeFile.getParent());
         Files.writeString(runtimeFile, new GsonBuilder().create().toJson(root), StandardCharsets.UTF_8);

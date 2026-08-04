@@ -249,9 +249,14 @@ public final class YSMRuntimeModel {
     private static final Map<String, YSMRuntimeModel> CACHE = new HashMap<>();
     private static final Map<String, Long> CACHE_MTIME = new HashMap<>();
 
-    /** Get the compiled runtime model for a YSM model id, or null if unavailable. */
+    /** Get the compiled runtime model for a model id, or null if unavailable. */
     public static YSMRuntimeModel get(String modelId) {
-        Path file = YSMMeshLibrary.getRuntimeFile(YSMMeshLibrary.meshIdOf(modelId));
+        String meshId = YSMMeshLibrary.meshIdOf(modelId);
+        Path file = YSMMeshLibrary.getRuntimeFile(meshId);
+        if (!Files.isRegularFile(file)) {
+            // TLM model-pack meshes keep their runtime scripts under the tlm/ subdir
+            file = YSMMeshLibrary.getRuntimeFile("tlm/" + meshId);
+        }
         long mtime;
         try {
             mtime = Files.getLastModifiedTime(file).toMillis();
@@ -265,7 +270,7 @@ public final class YSMRuntimeModel {
             }
             try {
                 String json = Files.readString(file);
-                YSMRuntimeModel model = compile(modelId, JsonParser.parseString(json).getAsJsonObject());
+                YSMRuntimeModel model = compile(JsonParser.parseString(json).getAsJsonObject());
                 CACHE.put(modelId, model);
                 CACHE_MTIME.put(modelId, mtime);
                 return model;
@@ -286,7 +291,7 @@ public final class YSMRuntimeModel {
         }
     }
 
-    private static YSMRuntimeModel compile(String modelId, JsonObject root) {
+    private static YSMRuntimeModel compile(JsonObject root) {
         // bones
         JsonArray bonesArr = root.getAsJsonArray("bones");
         Map<String, BoneRt> byName = new LinkedHashMap<>();
@@ -334,17 +339,26 @@ public final class YSMRuntimeModel {
         List<CompiledAnim> parallels = new ArrayList<>();
         Map<String, CompiledAnim> states = new HashMap<>();
         Map<String, CompiledAnim> conditions = new HashMap<>();
+        Set<String> brokenAnims = new HashSet<>();
         JsonObject anims = root.has("animations") ? root.getAsJsonObject("animations") : null;
         if (anims != null) {
             for (Map.Entry<String, JsonElement> entry : anims.entrySet()) {
                 String name = entry.getKey();
-                CompiledAnim anim = compileAnim(ScriptJson.animationsFromJson(name, entry.getValue().getAsJsonObject()), boneIndex);
-                if (name.startsWith("pre_parallel") || name.startsWith("parallel")) {
-                    parallels.add(anim);
-                } else if (isConditionAnim(name)) {
-                    conditions.put(name, anim);
-                } else {
-                    states.put(name, anim);
+                try {
+                    CompiledAnim anim = compileAnim(ScriptJson.animationsFromJson(name, entry.getValue().getAsJsonObject()), boneIndex);
+                    if (name.startsWith("pre_parallel") || name.startsWith("parallel")) {
+                        parallels.add(anim);
+                    } else if (isConditionAnim(name)) {
+                        conditions.put(name, anim);
+                    } else {
+                        states.put(name, anim);
+                    }
+                } catch (Exception e) {
+                    // One broken molang animation must not disable variant visibility
+                    // for the whole model (that would render every variant at once).
+                    if (brokenAnims.add(name)) {
+                        YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: skipped broken runtime animation '{}': {}", name, e.toString());
+                    }
                 }
             }
         }
