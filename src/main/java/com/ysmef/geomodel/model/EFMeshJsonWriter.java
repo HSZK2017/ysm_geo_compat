@@ -77,7 +77,7 @@ public class EFMeshJsonWriter {
         if (quads < 0) {
             return -1;
         }
-        writeRuntimeJson(geoModel, pkg.scriptAnims, runtimeFile);
+        writeRuntimeJson(geoModel, pkg.scriptAnims, runtimeFile, true);
         return quads;
     }
 
@@ -167,9 +167,13 @@ public class EFMeshJsonWriter {
      * (hierarchy, bind transforms, EF joint binding) plus the molang animations that
      * drive the model's variant behavior. Used for YSM packages as well as TLM
      * model-pack models that ship bedrock animation files.
+     *
+     * @param tlmShowBackpack for TLM model-pack models: whether the model entry's
+     *                        "show_backpack" allows the model's own backpack
+     *                        geometry (driven by the tlm.has_backpack query).
      */
     public static void writeRuntimeJson(YSMGeoModel geoModel, Map<String, com.ysmef.geomodel.ysm.script.ScriptAnim> scriptAnims,
-                                        Path runtimeFile) throws IOException {
+                                        Path runtimeFile, boolean tlmShowBackpack) throws IOException {
         JsonObject root = new JsonObject();
 
         JsonArray bones = new JsonArray();
@@ -192,6 +196,8 @@ public class EFMeshJsonWriter {
             bones.add(obj);
         }
         root.add("bones", bones);
+
+        root.addProperty("tlm_show_backpack", tlmShowBackpack);
 
         root.add("animations", com.ysmef.geomodel.ysm.script.ScriptJson.animationsToJson(scriptAnims));
 

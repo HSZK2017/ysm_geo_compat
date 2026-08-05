@@ -184,7 +184,33 @@ public final class TlmModelLibrary {
             }
         }
 
-        return writeAndRegister(modelId, modelIdRl, geoModel, scale, ourTexture, scriptAnims);
+        boolean showBackpack = !entry.has("show_backpack") || entry.get("show_backpack").getAsBoolean();
+
+        // extra textures become model variants (model_id + "_" + md5(texturePath)),
+        // the same ids TLM hands out through EntityMaid#getModelId
+        Map<String, ResourceLocation> extraTextures = new LinkedHashMap<>();
+        if (entry.has("extra_textures") && entry.get("extra_textures").isJsonArray()) {
+            for (JsonElement elem : entry.getAsJsonArray("extra_textures")) {
+                ResourceLocation texRl = ResourceLocation.tryParse(elem.getAsString());
+                if (texRl == null) {
+                    continue;
+                }
+                Path extraFile = packRoot.resolve("assets").resolve(texRl.getNamespace()).resolve(texRl.getPath());
+                if (!Files.isRegularFile(extraFile)) {
+                    continue;
+                }
+                try {
+                    ResourceLocation registered = YSMMeshLibrary.registerTextureBytes(
+                            "tlm/" + sanitize(texRl.getNamespace()) + "/" + sanitize(texRl.getPath() + "_" + variantHash(texRl)),
+                            Files.readAllBytes(extraFile));
+                    extraTextures.put(modelId + "_" + variantHash(texRl), registered);
+                } catch (Exception e) {
+                    YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM extra texture {}: {}", texRl, e.toString());
+                }
+            }
+        }
+
+        return writeAndRegister(modelId, modelIdRl, geoModel, scale, ourTexture, scriptAnims, showBackpack, extraTextures);
     }
 
     /** Convert a model entry, reading model/texture files via the resource manager (jar-builtin). */
@@ -234,12 +260,55 @@ public final class TlmModelLibrary {
             }
         }
 
-        return writeAndRegister(modelId, modelIdRl, geoModel, scale, ourTexture, scriptAnims);
+        boolean showBackpack = !entry.has("show_backpack") || entry.get("show_backpack").getAsBoolean();
+
+        Map<String, ResourceLocation> extraTextures = new LinkedHashMap<>();
+        if (entry.has("extra_textures") && entry.get("extra_textures").isJsonArray()) {
+            for (JsonElement elem : entry.getAsJsonArray("extra_textures")) {
+                ResourceLocation texRl = ResourceLocation.tryParse(elem.getAsString());
+                if (texRl == null) {
+                    continue;
+                }
+                Optional<Resource> extraResource = resourceManager.getResource(texRl);
+                if (extraResource.isEmpty()) {
+                    continue;
+                }
+                try (InputStream in = extraResource.get().open()) {
+                    ResourceLocation registered = YSMMeshLibrary.registerTextureBytes(
+                            "tlm/" + sanitize(texRl.getNamespace()) + "/" + sanitize(texRl.getPath() + "_" + variantHash(texRl)),
+                            in.readAllBytes());
+                    extraTextures.put(modelId + "_" + variantHash(texRl), registered);
+                } catch (Exception e) {
+                    YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM extra texture {}: {}", texRl, e.toString());
+                }
+            }
+        }
+
+        return writeAndRegister(modelId, modelIdRl, geoModel, scale, ourTexture, scriptAnims, showBackpack, extraTextures);
+    }
+
+    /**
+     * The md5(texture path) suffix TLM appends to a model id for every
+     * extra_textures variant (see TLM's CustomModelPack#decorate).
+     */
+    private static String variantHash(ResourceLocation textureRl) {
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("MD5");
+            byte[] bytes = digest.digest(textureRl.getPath().getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(32);
+            for (byte b : bytes) {
+                sb.append(String.format("%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return Integer.toHexString(textureRl.getPath().hashCode());
+        }
     }
 
     private static boolean writeAndRegister(String modelId, ResourceLocation modelIdRl,
                                             YSMGeoModel geoModel, float scale, ResourceLocation ourTexture,
-                                            Map<String, ScriptAnim> scriptAnims) {
+                                            Map<String, ScriptAnim> scriptAnims, boolean showBackpack,
+                                            Map<String, ResourceLocation> extraTextures) {
         String meshFile = sanitize(modelIdRl.getNamespace()) + "__" + sanitize(modelIdRl.getPath());
         Path outFile = MESH_DIR.resolve(meshFile + ".json");
         String texturePath = ourTexture != null
@@ -254,7 +323,7 @@ public final class TlmModelLibrary {
         }
         if (!scriptAnims.isEmpty()) {
             try {
-                EFMeshJsonWriter.writeRuntimeJson(geoModel, scriptAnims, YSMMeshLibrary.getRuntimeFile("tlm/" + meshFile));
+                EFMeshJsonWriter.writeRuntimeJson(geoModel, scriptAnims, YSMMeshLibrary.getRuntimeFile("tlm/" + meshFile), showBackpack);
             } catch (Exception e) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to write TLM runtime for {}: {}", modelId, e.toString());
             }
@@ -264,6 +333,9 @@ public final class TlmModelLibrary {
                 YSMGeoCompat.MODID, "entity/tlm/" + meshFile,
                 (loader) -> loader.loadSkinnedMesh(YSMMesh::new));
         MESHES.put(modelId, new TlmMeshEntry(accessor, ourTexture));
+        for (Map.Entry<String, ResourceLocation> variant : extraTextures.entrySet()) {
+            MESHES.put(variant.getKey(), new TlmMeshEntry(accessor, variant.getValue()));
+        }
         return true;
     }
 

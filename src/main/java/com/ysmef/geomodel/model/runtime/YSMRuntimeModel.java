@@ -53,16 +53,24 @@ public final class YSMRuntimeModel {
     final Map<String, CompiledAnim> states;
     final Map<String, CompiledAnim> conditionAnims;
 
+    /**
+     * TLM model-pack entries may forbid the model's own backpack geometry
+     * ("show_backpack": false); the tlm.has_backpack query is forced to 0 then.
+     * Always true for YSM packages.
+     */
+    public final boolean tlmShowBackpack;
+
     private final Map<UUID, YSMPlayerAnimator> animators = new ConcurrentHashMap<>();
 
     private YSMRuntimeModel(BoneRt[] bones, Map<String, Integer> boneIndex,
                             List<CompiledAnim> parallels, Map<String, CompiledAnim> states,
-                            Map<String, CompiledAnim> conditionAnims) {
+                            Map<String, CompiledAnim> conditionAnims, boolean tlmShowBackpack) {
         this.bones = bones;
         this.boneIndex = boneIndex;
         this.parallels = parallels;
         this.states = states;
         this.conditionAnims = conditionAnims;
+        this.tlmShowBackpack = tlmShowBackpack;
     }
 
     public YSMPlayerAnimator animatorFor(LivingEntity entity) {
@@ -251,12 +259,7 @@ public final class YSMRuntimeModel {
 
     /** Get the compiled runtime model for a model id, or null if unavailable. */
     public static YSMRuntimeModel get(String modelId) {
-        String meshId = YSMMeshLibrary.meshIdOf(modelId);
-        Path file = YSMMeshLibrary.getRuntimeFile(meshId);
-        if (!Files.isRegularFile(file)) {
-            // TLM model-pack meshes keep their runtime scripts under the tlm/ subdir
-            file = YSMMeshLibrary.getRuntimeFile("tlm/" + meshId);
-        }
+        Path file = runtimeFileOf(modelId);
         long mtime;
         try {
             mtime = Files.getLastModifiedTime(file).toMillis();
@@ -281,6 +284,37 @@ public final class YSMRuntimeModel {
                 return null;
             }
         }
+    }
+
+    /**
+     * Resolves the runtime file of a model id. TLM model-pack meshes keep their
+     * runtime scripts under the tlm/ subdir and are named "namespace__path"
+     * (tlmMeshIdOf); TLM's extra-texture variants (model_id + "_" + md5(texturePath))
+     * share the base model's runtime file. YSM model ids use the plain sanitize
+     * name at the top level.
+     */
+    private static Path runtimeFileOf(String modelId) {
+        List<Path> candidates = new ArrayList<>();
+        addRuntimeCandidates(candidates, YSMMeshLibrary.meshIdOf(modelId));
+        String tlmId = YSMMeshLibrary.tlmMeshIdOf(modelId);
+        if (tlmId != null && !tlmId.equals(YSMMeshLibrary.meshIdOf(modelId))) {
+            addRuntimeCandidates(candidates, tlmId);
+        }
+        if (tlmId != null && tlmId.length() > 33 && tlmId.matches(".*_[0-9a-f]{32}")) {
+            // TLM extra-texture variant: reuse the base model's runtime file
+            addRuntimeCandidates(candidates, tlmId.substring(0, tlmId.length() - 33));
+        }
+        for (Path candidate : candidates) {
+            if (Files.isRegularFile(candidate)) {
+                return candidate;
+            }
+        }
+        return candidates.get(0);
+    }
+
+    private static void addRuntimeCandidates(List<Path> out, String meshId) {
+        out.add(YSMMeshLibrary.getRuntimeFile(meshId));
+        out.add(YSMMeshLibrary.getRuntimeFile("tlm/" + meshId));
     }
 
     /** Forget all cached runtime models (called when meshes are regenerated). */
@@ -365,7 +399,8 @@ public final class YSMRuntimeModel {
         // pre_parallel* first, then parallel*, each in numeric order
         parallels.sort(Comparator.comparing((CompiledAnim a) -> a.name.startsWith("pre_parallel") ? 0 : 1)
                 .thenComparing(a -> a.name));
-        return new YSMRuntimeModel(bones, boneIndex, parallels, states, conditions);
+        boolean tlmShowBackpack = !root.has("tlm_show_backpack") || root.get("tlm_show_backpack").getAsBoolean();
+        return new YSMRuntimeModel(bones, boneIndex, parallels, states, conditions, tlmShowBackpack);
     }
 
     private static boolean isConditionAnim(String name) {
