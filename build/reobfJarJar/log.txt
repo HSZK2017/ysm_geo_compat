@@ -222,6 +222,7 @@ Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/enti
 Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/entity/passive/EntityMaid/shootCrossbowProjectile(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/entity/projectile/Projectile;F)V from net/minecraft/world/entity/monster/CrossbowAttackMob/shootCrossbowProjectile(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/entity/projectile/Projectile;F)V: shootCrossbowProjectile -> m_5811_
 Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/entity/passive/EntityMaid/setChargingCrossbow(Z)V from net/minecraft/world/entity/monster/CrossbowAttackMob/setChargingCrossbow(Z)V: setChargingCrossbow -> m_6136_
 Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/api/entity/IMaid/onClimbable()Z from com/github/tartaricacid/touhoulittlemaid/entity/passive/EntityMaid/onClimbable()Z: onClimbable -> m_6147_
+Conflicting propagated mapping for net/EFTLM/EF/Model/EFTLM_Meshes/onResourceManagerReload(Lnet/minecraft/server/packs/resources/ResourceManager;)V from net/minecraft/server/packs/resources/ResourceManagerReloadListener/onResourceManagerReload(Lnet/minecraft/server/packs/resources/ResourceManager;)V: onResourceManagerReload -> m_6213_
 Adding extras
 Sorting
 Writing Output: E:\program\JAVA\move\ysm_geo_model\build\reobfJarJar\output.jar

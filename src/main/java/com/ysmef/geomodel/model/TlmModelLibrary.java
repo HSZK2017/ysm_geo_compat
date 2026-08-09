@@ -41,6 +41,62 @@ public final class TlmModelLibrary {
 
     private TlmModelLibrary() {}
 
+    /**
+     * EpicFight_TouhouLittleMaid applies its own 0.8 render scale to every maid
+     * it renders (MaidPatch#getModelMatrix). For models that EFTLM covers with
+     * its own built-in meshes (baked at scale 1.0), baking the model pack's
+     * render_entity_scale on top would shrink the maid twice, so the baked scale
+     * is dropped in exactly that case; models EFTLM does not cover keep the
+     * model pack's render_entity_scale.
+     */
+    private static volatile Boolean eftlmLoaded = null;
+
+    private static boolean isEftlmLoaded() {
+        Boolean loaded = eftlmLoaded;
+        if (loaded == null) {
+            boolean result = false;
+            try {
+                result = net.minecraftforge.fml.ModList.get() != null
+                        && net.minecraftforge.fml.ModList.get().isLoaded("ef_tlm");
+            } catch (Throwable ignored) {
+            }
+            eftlmLoaded = result;
+            return result;
+        }
+        return loaded;
+    }
+
+    private static float maidScaleOf(JsonObject entry, ResourceManager resourceManager) {
+        if (isEftlmLoaded() && eftlmHasBuiltinMesh(entry, resourceManager)) {
+            return 1.0F;
+        }
+        return entry.has("render_entity_scale")
+                ? Math.max(0.2f, Math.min(2.0f, entry.get("render_entity_scale").getAsFloat()))
+                : 1.0f;
+    }
+
+    /**
+     * Whether EFTLM ships a built-in mesh for this model: EFTLM's registry
+     * (EFTLM_Meshes) is keyed by the model id with the namespace stripped
+     * (MaidPatch#getModelID) and loaded from its animmodels/entity/*.json
+     * files, so the same file lookup is performed against the resource
+     * manager (independent of EFTLM's own reload timing).
+     */
+    private static boolean eftlmHasBuiltinMesh(JsonObject entry, ResourceManager resourceManager) {
+        if (!entry.has("model_id")) {
+            return false;
+        }
+        String modelId = entry.get("model_id").getAsString();
+        int colon = modelId.indexOf(':');
+        String stripped = colon >= 0 ? modelId.substring(colon + 1) : modelId;
+        try {
+            return resourceManager.getResource(
+                    ResourceLocation.fromNamespaceAndPath("ef_tlm", "animmodels/entity/" + stripped + ".json")).isPresent();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     public static TlmMeshEntry find(String modelId) {
         return MESHES.get(modelId);
     }
@@ -145,9 +201,7 @@ public final class TlmModelLibrary {
 
         String namespace = modelIdRl.getNamespace();
         boolean isGecko = entry.has("is_gecko") && entry.get("is_gecko").getAsBoolean();
-        float scale = entry.has("render_entity_scale")
-                ? Math.max(0.2f, Math.min(2.0f, entry.get("render_entity_scale").getAsFloat()))
-                : 1.0f;
+        float scale = maidScaleOf(entry, net.minecraft.client.Minecraft.getInstance().getResourceManager());
 
         // resolve model file path relative to packRoot/assets/<ns>/<path>
         String modelPathStr = entry.has("model")
@@ -229,9 +283,7 @@ public final class TlmModelLibrary {
                 : ResourceLocation.fromNamespaceAndPath(modelIdRl.getNamespace(),
                         "textures/entity/" + modelIdRl.getPath() + ".png");
         boolean isGecko = entry.has("is_gecko") && entry.get("is_gecko").getAsBoolean();
-        float scale = entry.has("render_entity_scale")
-                ? Math.max(0.2f, Math.min(2.0f, entry.get("render_entity_scale").getAsFloat()))
-                : 1.0f;
+        float scale = maidScaleOf(entry, resourceManager);
 
         Optional<Resource> modelResource = resourceManager.getResource(modelRl);
         if (modelResource.isEmpty()) return false;
