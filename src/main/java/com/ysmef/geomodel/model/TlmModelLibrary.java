@@ -20,6 +20,7 @@ import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * Registry of converted Epic Fight base meshes for Touhou Little Maid GEO models.
@@ -42,13 +43,17 @@ public final class TlmModelLibrary {
     private TlmModelLibrary() {}
 
     /**
-     * EpicFight_TouhouLittleMaid applies its own 0.8 render scale to every maid
-     * it renders (MaidPatch#getModelMatrix). For models that EFTLM covers with
-     * its own built-in meshes (baked at scale 1.0), baking the model pack's
-     * render_entity_scale on top would shrink the maid twice, so the baked scale
-     * is dropped in exactly that case; models EFTLM does not cover keep the
-     * model pack's render_entity_scale.
+     * EpicFight_TouhouLittleMaid applies its own 0.8 render scale to EVERY maid
+     * it renders (hardcoded in MaidPatch#getModelMatrix). The baked scale is
+     * chosen so the final on-screen size matches the model pack's intent:
+     * - EFTLM ships a built-in mesh for the model (WineFox family): EFTLM's
+     *   tuned mesh takes over and our baked scale is dropped to 1.0
+     * - otherwise our converted mesh is rendered under EFTLM's 0.8, so the
+     *   pack's render_entity_scale is baked divided by 0.8 to cancel it
+     * - without EFTLM the pack scale is baked as-is
      */
+    private static final float EFTLM_RENDER_SCALE = 0.8F;
+
     private static volatile Boolean eftlmLoaded = null;
 
     private static boolean isEftlmLoaded() {
@@ -67,12 +72,47 @@ public final class TlmModelLibrary {
     }
 
     private static float maidScaleOf(JsonObject entry, ResourceManager resourceManager) {
-        if (isEftlmLoaded() && eftlmHasBuiltinMesh(entry, resourceManager)) {
-            return 1.0F;
-        }
-        return entry.has("render_entity_scale")
+        boolean eftlm = isEftlmLoaded();
+        String modelId = entry.has("model_id") ? entry.get("model_id").getAsString() : "?";
+        boolean hasBuiltin = eftlm && eftlmHasBuiltinMesh(entry, resourceManager);
+        boolean coveredOverride = isEftlmCovered(modelId);
+        float packScale = entry.has("render_entity_scale")
                 ? Math.max(0.2f, Math.min(2.0f, entry.get("render_entity_scale").getAsFloat()))
                 : 1.0f;
+        float scale;
+        if (eftlm && (hasBuiltin || coveredOverride)) {
+            scale = 1.0F;
+        } else if (eftlm) {
+            scale = packScale / EFTLM_RENDER_SCALE;
+        } else {
+            scale = packScale;
+        }
+        float finalScale = eftlm ? scale * EFTLM_RENDER_SCALE : scale;
+        YSMGeoCompat.LOGGER.info(
+                "YSM-GEO Compat: maid scale '{}': eftlmLoaded={}, eftlmBuiltinMesh={}, eftlmCoveredOverride={}, packScale={}, bakedScale={}, finalRenderScale={}",
+                modelId, eftlm, hasBuiltin, coveredOverride, packScale, scale, finalScale);
+        return scale;
+    }
+
+    /**
+     * Model ids treated as covered by EFTLM's built-in meshes even though EFTLM
+     * registers no dedicated mesh for them: EFTLM's getMeshProvider then falls
+     * back to its default WineFox mesh, and this mod must not substitute its
+     * converted mesh for them.
+     */
+    private static final Set<String> EFTLM_COVERED_IDS = Set.of("winefox_blue");
+
+    /**
+     * Whether the given model id (with or without namespace) is covered by
+     * EFTLM's built-in meshes, either directly or via the override list.
+     */
+    public static boolean isEftlmCovered(String modelId) {
+        if (modelId == null) {
+            return false;
+        }
+        int colon = modelId.indexOf(':');
+        String stripped = colon >= 0 ? modelId.substring(colon + 1) : modelId;
+        return EFTLM_COVERED_IDS.contains(stripped);
     }
 
     /**
