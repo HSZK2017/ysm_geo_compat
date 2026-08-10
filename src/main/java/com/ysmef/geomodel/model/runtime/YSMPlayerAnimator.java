@@ -1,5 +1,7 @@
 package com.ysmef.geomodel.model.runtime;
 
+import com.ysmef.geomodel.YSMGeoCompat;
+import com.ysmef.geomodel.config.YSMCompatConfig;
 import com.ysmef.geomodel.model.EFMeshJsonWriter;
 import com.ysmef.geomodel.model.YSMMesh;
 import com.ysmef.geomodel.ysm.script.Molang;
@@ -48,12 +50,16 @@ public final class YSMPlayerAnimator implements Molang.Env {
 
     private final YSMRuntimeModel model;
 
-    // molang state
-    private final Map<String, Double> vars = new HashMap<>();
-    private final Map<String, Double> queries = new HashMap<>();
+    // molang state (id-keyed slots, see Molang#idOf: queries and variables are
+    // interned into stable integer ids at compile time, so the hot evaluation
+    // path does no String hashing)
+    private double[] varsById = new double[32];
+    private boolean[] varSetById = new boolean[32];
+    private double[] queriesById = new double[256];
+    private static final int Q_ANIM_TIME = Molang.idOf("query.anim_time");
     private ItemStack mainHand = ItemStack.EMPTY;
     private ItemStack offHand = ItemStack.EMPTY;
-    private String currentState = "";
+    private volatile String currentState = "";
     private float animTimeCurrent;
 
     // frame tracking
@@ -73,10 +79,58 @@ public final class YSMPlayerAnimator implements Molang.Env {
     private final boolean[] hasPos, hasRot, hasScale;
     private final Matrix4f[] localAnim;
     private final Matrix4f[] deltaModel;
-    private final Matrix4f[] chainDelta;
-    private final float[] effMinScale;
+    /** Double-buffered composed chain deltas: the worker evaluates into one buffer while the render thread reads the other. */
+    private final Matrix4f[][] chainDeltaBuf;
+    /** Double-buffered effective visibility scales (same layout as chainDeltaBuf). */
+    private final float[][] effMinScaleBuf;
+    /** Buffer index currently written by evaluate(); the read side uses {@link #readyBuffer}. */
+    private int writeBuf;
+    /** Buffer index of the last completed evaluation, published via the volatile write. */
+    private volatile int readyBuffer = -1;
+    private final boolean[] composed;
+    private final OpenMatrix4f[] partMats;
+    private final Matrix4f scratchA = new Matrix4f();
+    private final float[] evalL0 = new float[3];
+    private final float[] evalR0 = new float[3];
+    private final float[] evalP0 = new float[3];
+    private final float[] evalP3 = new float[3];
+
+    /** Incremental keyframe lookup cursors, one per compiled channel (amortized O(1)). */
+    private final int[] channelCursor;
+
+    /** Per-bone mesh parts captured once per mesh instance (see ensurePartMap). */
+    private YSMMesh partMapMesh;
+    private List<Map.Entry<String, MeshPart>> partEntries;
+    private int[] partBoneIdx;
+
+    // LOD-style evaluation rate limiting (OpenYSM AnimatableEntity#getRefreshRate):
+    // entities beyond 40 blocks evaluate at 30 Hz, beyond 64 blocks at 10 Hz,
+    // everything else (and the local player) every frame. Skipped frames replay
+    // the last evaluated bone state into the mesh instead of re-evaluating molang.
+    private static final double LOD_DIST_SQR_NEAR = 40.0 * 40.0;
+    private static final double LOD_DIST_SQR_FAR = 64.0 * 64.0;
+    private volatile boolean evaluatedOnce = false;
 
     private final List<YSMRuntimeModel.CompiledAnim> activeAnims = new ArrayList<>();
+
+    /**
+     * ModernYSM-style async script evaluation: evaluations for entities other
+     * than the local player run on this single-threaded daemon pool; the render
+     * thread consumes the last completed result (double-buffered, see
+     * chainDeltaBuf/effMinScaleBuf). The first evaluation of each animator stays
+     * synchronous so the mesh never starts in an un-evaluated state.
+     */
+    private static final java.util.concurrent.ExecutorService SCRIPT_POOL = java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
+        Thread thread = new Thread(runnable, "ysm-geo-script");
+        thread.setDaemon(true);
+        return thread;
+    });
+
+    /** Dedupe flag: only one evaluation may be in flight per animator. */
+    private final java.util.concurrent.atomic.AtomicBoolean evalPending = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Global switch: disabled permanently after the first off-thread failure. */
+    private static volatile boolean ASYNC_EVAL_FAILED = false;
 
     public YSMPlayerAnimator(YSMRuntimeModel model) {
         this.model = model;
@@ -89,25 +143,116 @@ public final class YSMPlayerAnimator implements Molang.Env {
         hasScale = new boolean[n];
         localAnim = new Matrix4f[n];
         deltaModel = new Matrix4f[n];
-        chainDelta = new Matrix4f[n];
-        effMinScale = new float[n];
+        chainDeltaBuf = new Matrix4f[2][n];
+        effMinScaleBuf = new float[2][n];
+        composed = new boolean[n];
+        partMats = new OpenMatrix4f[n];
         for (int i = 0; i < n; i++) {
             localAnim[i] = new Matrix4f();
             deltaModel[i] = new Matrix4f();
-            chainDelta[i] = new Matrix4f();
+            chainDeltaBuf[0][i] = new Matrix4f();
+            chainDeltaBuf[1][i] = new Matrix4f();
+            partMats[i] = new OpenMatrix4f();
         }
+        channelCursor = new int[model.channelCount];
+        java.util.Arrays.fill(channelCursor, -1);
     }
 
     /**
      * Evaluate the scripts for this entity this frame and apply per-part hidden
      * flags and transforms to the mesh about to be drawn.
+     *
+     * Evaluation is rate-limited by distance (see LOD_DIST_SQR_*): the expensive
+     * part (query refresh, molang evaluation, keyframe lookup, matrix composition)
+     * runs at most every N ticks for distant entities; every frame the stored bone
+     * state from the last full evaluation is replayed into the mesh, so a
+     * rate-limited entity keeps rendering its last known pose instead of
+     * recomputing it.
+     *
+     * For entities other than the local player the evaluation itself runs on a
+     * background thread (config scriptAsyncEval): the render thread replays the
+     * last completed result, so the per-frame cost on the render thread is only
+     * the mesh push (O(parts), no molang).
      */
     public void apply(YSMMesh mesh, LivingEntity entity, OpenMatrix4f[] poses, float partialTick) {
         double now = (entity.tickCount + partialTick) / 20.0;
+        if (shouldFullEval(entity)) {
+            if (!evaluatedOnce || !useAsyncEval(entity)) {
+                evaluate(entity, partialTick, now);
+                evaluatedOnce = true;
+            } else {
+                submitAsyncEval(entity, partialTick, now);
+            }
+        }
+        pushToMesh(mesh);
+    }
+
+    private boolean useAsyncEval(LivingEntity entity) {
+        return YSMCompatConfig.ENABLE_SCRIPT_ASYNC_EVAL.get() && !ASYNC_EVAL_FAILED
+                && Minecraft.getInstance().player != entity;
+    }
+
+    /**
+     * Submit one evaluation to the script pool (deduped: at most one in flight
+     * per animator). Runs the same evaluate() as the synchronous path; the
+     * double-buffered result state is published via the volatile readyBuffer.
+     */
+    private void submitAsyncEval(LivingEntity entity, float partialTick, double now) {
+        if (!evalPending.compareAndSet(false, true)) {
+            return;
+        }
+        SCRIPT_POOL.execute(() -> {
+            try {
+                evaluate(entity, partialTick, now);
+                evaluatedOnce = true;
+            } catch (Throwable t) {
+                // never leave the render path broken: fall back to synchronous evaluation
+                ASYNC_EVAL_FAILED = true;
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: async script evaluation failed for model '{}', falling back to synchronous evaluation", model.modelId, t);
+            } finally {
+                evalPending.set(false);
+            }
+        });
+    }
+
+    /**
+     * Distance-based evaluation gate: the local player (and everyone near the
+     * camera) evaluates every frame; entities beyond 40/64 blocks drop to
+     * 30/10 Hz. The first evaluation is always full so the mesh starts with
+     * correct state.
+     */
+    private boolean shouldFullEval(LivingEntity entity) {
+        if (!evaluatedOnce) {
+            return true;
+        }
+        Player local = Minecraft.getInstance().player;
+        if (local == null || entity == local) {
+            return true;
+        }
+        double distSqr = entity.distanceToSqr(local);
+        int tick = entity.tickCount;
+        if (distSqr > LOD_DIST_SQR_FAR) {
+            return tick % 6 == 0;
+        }
+        if (distSqr > LOD_DIST_SQR_NEAR) {
+            return tick % 2 == 0;
+        }
+        return true;
+    }
+
+    /**
+     * Full evaluation: refresh the query context, resolve the state machine and
+     * evaluate all active animations into the scratch arrays, then compose the
+     * per-bone chain deltas and effective visibility scales into the currently
+     * unused buffer and publish it (volatile readyBuffer). Entity reads
+     * (held items, position delta, ...) happen here, so the whole evaluation is
+     * self-contained and can run on the script pool.
+     */
+    private void evaluate(LivingEntity entity, float partialTick, double now) {
+        writeBuf = readyBuffer < 0 ? 0 : 1 - readyBuffer;
         mainHand = entity.getItemInHand(InteractionHand.MAIN_HAND);
         offHand = entity.getItemInHand(InteractionHand.OFF_HAND);
         updatePosDelta(entity);
-
         String state = resolveState(entity);
         if (!state.equals(currentState)) {
             currentState = state;
@@ -132,7 +277,8 @@ public final class YSMPlayerAnimator implements Molang.Env {
             evalAnim(anim, now);
         }
 
-        composeAndApply(mesh, entity, poses);
+        compose();
+        readyBuffer = writeBuf;
     }
 
     // ------------------------------------------------------------------
@@ -239,13 +385,22 @@ public final class YSMPlayerAnimator implements Molang.Env {
         }
     }
 
+    /**
+     * Evaluate a keyframe channel at time t into out. The search window is
+     * carried between frames per channel (OpenYSM InterpolationLookup): while
+     * the animation time advances monotonically the lookup starts from the
+     * previous window, making the scan amortized O(1); a backwards jump (loop
+     * wrap / animation restart) resets the cursor.
+     */
     private void evalChannel(YSMRuntimeModel.CompiledChannel channel, float t, float[] out) {
         float[] times = channel.times;
         int n = times.length;
-        int right = 1;
+        int cursor = channelCursor[channel.channelId];
+        int right = (cursor < 0 || t < times[Math.min(cursor, n - 1)]) ? 1 : cursor;
         while (right < n && times[right] <= t) {
             right++;
         }
+        channelCursor[channel.channelId] = right;
         if (right >= n) {
             evalValue(channel.post[n - 1], out);
             return;
@@ -263,21 +418,17 @@ public final class YSMPlayerAnimator implements Molang.Env {
             return;
         }
         float alpha = (t - t0) / (t1 - t0);
-        float[] leftVal = {0, 0, 0};
-        float[] rightVal = {0, 0, 0};
-        evalValue(channel.post[left], leftVal);
-        evalValue(channel.pre[right] != null ? channel.pre[right] : channel.post[right], rightVal);
+        evalValue(channel.post[left], evalL0);
+        evalValue(channel.pre[right] != null ? channel.pre[right] : channel.post[right], evalR0);
         if (lerp == ScriptAnimKeyLerp.CATMULLROM && n >= 2) {
-            float[] p0 = {0, 0, 0};
-            float[] p3 = {0, 0, 0};
-            evalValue(channel.post[Math.max(0, left - 1)], p0);
-            evalValue(channel.post[Math.min(n - 1, right + 1)], p3);
+            evalValue(channel.post[Math.max(0, left - 1)], evalP0);
+            evalValue(channel.post[Math.min(n - 1, right + 1)], evalP3);
             for (int i = 0; i < 3; i++) {
-                out[i] = catmullRom(p0[i], leftVal[i], rightVal[i], p3[i], alpha);
+                out[i] = catmullRom(evalP0[i], evalL0[i], evalR0[i], evalP3[i], alpha);
             }
         } else {
             for (int i = 0; i < 3; i++) {
-                out[i] = leftVal[i] + (rightVal[i] - leftVal[i]) * alpha;
+                out[i] = evalL0[i] + (evalR0[i] - evalL0[i]) * alpha;
             }
         }
     }
@@ -298,29 +449,99 @@ public final class YSMPlayerAnimator implements Molang.Env {
     // Composition & application
     // ------------------------------------------------------------------
 
-    private void composeAndApply(YSMMesh mesh, LivingEntity entity, OpenMatrix4f[] poses) {
+    /**
+     * Compose the per-bone chain deltas and effective visibility scales into the
+     * current write buffer. Runs only on full-evaluation frames.
+     */
+    private void compose() {
+        java.util.Arrays.fill(composed, false);
         int n = model.bones.length;
-        boolean[] composed = new boolean[n];
         for (int i = 0; i < n; i++) {
-            composeBone(i, composed);
+            composeBone(i);
         }
+    }
+
+    /**
+     * Push the stored per-bone state (hidden flags + chain deltas) into the mesh
+     * parts. Runs every frame - also on rate-limited frames, replaying the state
+     * from the last full evaluation (read side of the double buffer) so the
+     * shared mesh always reflects the entity currently being drawn.
+     */
+    private void pushToMesh(YSMMesh mesh) {
+        ensurePartMap(mesh);
+        int ready = readyBuffer;
+        if (ready < 0) {
+            return;
+        }
+        float[] eff = effMinScaleBuf[ready];
+        Matrix4f[] chain = chainDeltaBuf[ready];
+        for (int i = 0; i < partEntries.size(); i++) {
+            int boneIdx = partBoneIdx[i];
+            MeshPart part = partEntries.get(i).getValue();
+            boolean hidden = eff[boneIdx] < HIDE_SCALE_EPSILON;
+            part.setHidden(hidden);
+            if (!hidden && !isIdentity(chain[boneIdx])) {
+                importInto(partMats[boneIdx], chain[boneIdx]);
+                mesh.setRuntimeTransform(partEntries.get(i).getKey(), partMats[boneIdx]);
+            }
+        }
+    }
+
+    /**
+     * Capture the per-bone mesh parts (entry + bone index) once per mesh instance
+     * (the mesh is shared and re-created only on regeneration, so the capture is
+     * cached per mesh reference). Removes the per-frame substring + hash lookups
+     * from the push loop.
+     */
+    private void ensurePartMap(YSMMesh mesh) {
+        if (partEntries != null && partMapMesh == mesh) {
+            return;
+        }
+        partMapMesh = mesh;
+        String prefix = EFMeshJsonWriter.BONE_PART_PREFIX;
+        List<Map.Entry<String, MeshPart>> entries = new ArrayList<>();
+        List<Integer> boneIdxList = new ArrayList<>();
         for (Map.Entry<String, MeshPart> entry : mesh.getPartEntrySetSafe()) {
             String partName = entry.getKey();
-            if (!partName.startsWith(EFMeshJsonWriter.BONE_PART_PREFIX)) {
+            if (!partName.startsWith(prefix)) {
                 continue;
             }
-            String boneName = partName.substring(EFMeshJsonWriter.BONE_PART_PREFIX.length());
-            Integer boneIdx = model.boneIndex.get(boneName);
-            MeshPart part = entry.getValue();
-            if (boneIdx == null) {
-                continue;
-            }
-            boolean hidden = effMinScale[boneIdx] < HIDE_SCALE_EPSILON;
-            part.setHidden(hidden);
-            if (!hidden && !isIdentity(chainDelta[boneIdx])) {
-                mesh.setRuntimeTransform(partName, OpenMatrix4f.importFromMojangMatrix(new Matrix4f(chainDelta[boneIdx])));
+            Integer boneIdx = model.boneIndex.get(partName.substring(prefix.length()));
+            if (boneIdx != null) {
+                entries.add(entry);
+                boneIdxList.add(boneIdx);
             }
         }
+        partEntries = entries;
+        partBoneIdx = new int[boneIdxList.size()];
+        for (int i = 0; i < boneIdxList.size(); i++) {
+            partBoneIdx[i] = boneIdxList.get(i);
+        }
+    }
+
+    /**
+     * OpenMatrix4f.importFromMojangMatrix without allocation: Epic Fight stores
+     * the matrix transposed relative to JOML (Mojang Matrix4f.get writes
+     * column-major, OpenMatrix4f.load reads row-major), so the field mapping is
+     * mXY <-> mYX.
+     */
+    private static void importInto(OpenMatrix4f om, Matrix4f m) {
+        om.m00 = m.m00();
+        om.m01 = m.m10();
+        om.m02 = m.m20();
+        om.m03 = m.m30();
+        om.m10 = m.m01();
+        om.m11 = m.m11();
+        om.m12 = m.m21();
+        om.m13 = m.m31();
+        om.m20 = m.m02();
+        om.m21 = m.m12();
+        om.m22 = m.m22();
+        om.m23 = m.m32();
+        om.m30 = m.m03();
+        om.m31 = m.m13();
+        om.m32 = m.m23();
+        om.m33 = m.m33();
     }
 
     private static boolean isIdentity(Matrix4f m) {
@@ -336,16 +557,19 @@ public final class YSMPlayerAnimator implements Molang.Env {
      * Computes the bone's animated local transform, its model-space animation
      * delta (conjugated into bind space) and the composed delta of the whole
      * chain up to the nearest Epic-Fight-driven ancestor, plus the effective
-     * visibility scale along the chain.
+     * visibility scale along the chain. Allocation-free: all matrices are
+     * persistent scratch (bindWorldInv is precomputed at model load).
      */
-    private void composeBone(int i, boolean[] composed) {
+    private void composeBone(int i) {
         if (composed[i]) {
             return;
         }
         YSMRuntimeModel.BoneRt bone = model.bones[i];
         if (bone.parent >= 0) {
-            composeBone(bone.parent, composed);
+            composeBone(bone.parent);
         }
+        Matrix4f[] chain = chainDeltaBuf[writeBuf];
+        float[] eff = effMinScaleBuf[writeBuf];
 
         float sx = hasScale[i] ? animScale[i][0] : 1f;
         float sy = hasScale[i] ? animScale[i][1] : 1f;
@@ -373,21 +597,21 @@ public final class YSMPlayerAnimator implements Molang.Env {
 
         // delta of this bone's animated local vs its bind local, conjugated into
         // model bind space so it can pre-multiply the Epic Fight joint pose
-        Matrix4f localDelta = new Matrix4f(localAnim[i]).mul(bone.bindLocalInv);
-        if (isIdentity(localDelta)) {
+        scratchA.set(localAnim[i]).mul(bone.bindLocalInv);
+        if (isIdentity(scratchA)) {
             deltaModel[i].identity();
         } else {
-            deltaModel[i].set(bone.bindWorld).mul(localDelta).mul(new Matrix4f(bone.bindWorld).invert());
+            deltaModel[i].set(bone.bindWorld).mul(scratchA).mul(bone.bindWorldInv);
         }
 
         float parentMinScale = 1f;
         if (bone.parent >= 0) {
-            parentMinScale = effMinScale[bone.parent];
-            chainDelta[i].set(chainDelta[bone.parent]).mul(deltaModel[i]);
+            parentMinScale = eff[bone.parent];
+            chain[i].set(chain[bone.parent]).mul(deltaModel[i]);
         } else {
-            chainDelta[i].set(deltaModel[i]);
+            chain[i].set(deltaModel[i]);
         }
-        effMinScale[i] = parentMinScale * Math.min(sx, Math.min(sy, sz));
+        eff[i] = parentMinScale * Math.min(sx, Math.min(sy, sz));
         composed[i] = true;
     }
 
@@ -536,29 +760,32 @@ public final class YSMPlayerAnimator implements Molang.Env {
     // ------------------------------------------------------------------
 
     @Override
-    public double getVar(String path) {
-        return vars.getOrDefault(path, 0.0);
+    public double getVarById(int id) {
+        return id < varsById.length && varSetById[id] ? varsById[id] : 0.0;
     }
 
     @Override
-    public boolean hasVar(String path) {
-        return vars.containsKey(path);
+    public boolean hasVarById(int id) {
+        return id < varsById.length && varSetById[id];
     }
 
     @Override
-    public void setVar(String path, double value) {
-        vars.put(path, value);
-    }
-
-    @Override
-    public double getQuery(String path) {
-        if (path.startsWith("q.")) {
-            path = "query." + path.substring(2);
+    public void setVarById(int id, double value) {
+        if (id >= varsById.length) {
+            int newLen = Math.max(id + 1, varsById.length * 2);
+            varsById = java.util.Arrays.copyOf(varsById, newLen);
+            varSetById = java.util.Arrays.copyOf(varSetById, newLen);
         }
-        if (path.equals("query.anim_time")) {
+        varsById[id] = value;
+        varSetById[id] = true;
+    }
+
+    @Override
+    public double getQueryById(int id) {
+        if (id == Q_ANIM_TIME) {
             return animTimeCurrent;
         }
-        return queries.getOrDefault(path, 0.0);
+        return id < queriesById.length ? queriesById[id] : 0.0;
     }
 
     @Override
@@ -667,8 +894,16 @@ public final class YSMPlayerAnimator implements Molang.Env {
         lastPosZ = entity.getZ();
     }
 
+    /** Write one query slot by its interned id (grows the slot array on demand). */
+    private void setQuery(String path, double value) {
+        int id = Molang.queryIdOf(path);
+        if (id >= queriesById.length) {
+            queriesById = java.util.Arrays.copyOf(queriesById, Math.max(id + 1, queriesById.length * 2));
+        }
+        queriesById[id] = value;
+    }
+
     private void fillQueries(LivingEntity entity, float partialTick, double now) {
-        Map<String, Double> q = queries;
         Minecraft mc = Minecraft.getInstance();
 
         float headYaw = entity.yHeadRotO + (entity.yHeadRot - entity.yHeadRotO) * partialTick;
@@ -690,77 +925,77 @@ public final class YSMPlayerAnimator implements Molang.Env {
         boolean onGround = entity.onGround();
         boolean crouching = entity.getPose() == Pose.CROUCHING;
 
-        q.put("query.life_time", now);
-        q.put("query.health", (double) entity.getHealth());
-        q.put("query.max_health", (double) entity.getMaxHealth());
-        q.put("query.hurt_time", (double) entity.hurtTime);
-        q.put("query.vertical_speed", verticalSpeed);
-        q.put("query.ground_speed", groundSpeed);
-        q.put("query.yaw_speed", yawSpeedDeg);
-        q.put("query.is_sneaking", onGround && crouching ? 1.0 : 0.0);
-        q.put("query.is_swimming", entity.isSwimming() ? 1.0 : 0.0);
-        q.put("query.is_sprinting", entity.isSprinting() ? 1.0 : 0.0);
-        q.put("query.is_on_ground", onGround ? 1.0 : 0.0);
-        q.put("query.is_jumping", !isCreativeFlying(entity) && !entity.isPassenger() && !onGround && !entity.isInWater() ? 1.0 : 0.0);
-        q.put("query.is_riding", entity.isPassenger() ? 1.0 : 0.0);
-        q.put("query.is_sleeping", entity.isSleeping() ? 1.0 : 0.0);
-        q.put("query.is_in_water", entity.isInWater() ? 1.0 : 0.0);
-        q.put("query.is_in_water_or_rain", entity.isInWaterRainOrBubble() ? 1.0 : 0.0);
-        q.put("query.is_gliding", entity.isFallFlying() ? 1.0 : 0.0);
-        q.put("query.is_on_fire", entity.isOnFire() ? 1.0 : 0.0);
-        q.put("query.is_playing_dead", entity.isDeadOrDying() ? 1.0 : 0.0);
-        q.put("query.is_spectator", entity instanceof Player player && player.isSpectator() ? 1.0 : 0.0);
-        q.put("query.is_using_item", entity.isUsingItem() ? 1.0 : 0.0);
-        q.put("query.is_eating", entity.getUseItem().getUseAnimation() == net.minecraft.world.item.UseAnim.EAT ? 1.0 : 0.0);
-        q.put("query.is_first_person", mc.options.getCameraType() == CameraType.FIRST_PERSON ? 1.0 : 0.0);
-        q.put("query.item_in_use_duration", entity.getTicksUsingItem() / 20.0);
-        q.put("query.item_max_use_duration", entity.getUseItem().getUseDuration() / 20.0);
-        q.put("query.item_remaining_use_duration", entity.getUseItemRemainingTicks() / 20.0);
-        q.put("query.walk_distance", (double) entity.moveDist);
-        q.put("query.modified_distance_moved", (double) entity.walkDist);
-        q.put("query.body_x_rotation", (double) entity.getXRot());
-        q.put("query.body_y_rotation", (double) net.minecraft.util.Mth.wrapDegrees(entity.getYRot()));
-        q.put("query.head_x_rotation", (double) netHeadYaw);
-        q.put("query.head_y_rotation", (double) headPitch);
-        q.put("query.cardinal_facing_2d", (double) entity.getDirection().get3DDataValue());
-        q.put("query.time_of_day", (entity.level().getDayTime() % 24000L) / 24000.0);
-        q.put("query.time_stamp", (double) entity.level().getDayTime());
-        q.put("query.moon_phase", (double) entity.level().getMoonPhase());
-        q.put("query.player_level", (double) (entity instanceof Player player ? player.experienceLevel : 0));
-        q.put("query.has_rider", entity.isVehicle() ? 1.0 : 0.0);
-        q.put("query.actor_count", 0.0);
+        setQuery("query.life_time", now);
+        setQuery("query.health", (double) entity.getHealth());
+        setQuery("query.max_health", (double) entity.getMaxHealth());
+        setQuery("query.hurt_time", (double) entity.hurtTime);
+        setQuery("query.vertical_speed", verticalSpeed);
+        setQuery("query.ground_speed", groundSpeed);
+        setQuery("query.yaw_speed", yawSpeedDeg);
+        setQuery("query.is_sneaking", onGround && crouching ? 1.0 : 0.0);
+        setQuery("query.is_swimming", entity.isSwimming() ? 1.0 : 0.0);
+        setQuery("query.is_sprinting", entity.isSprinting() ? 1.0 : 0.0);
+        setQuery("query.is_on_ground", onGround ? 1.0 : 0.0);
+        setQuery("query.is_jumping", !isCreativeFlying(entity) && !entity.isPassenger() && !onGround && !entity.isInWater() ? 1.0 : 0.0);
+        setQuery("query.is_riding", entity.isPassenger() ? 1.0 : 0.0);
+        setQuery("query.is_sleeping", entity.isSleeping() ? 1.0 : 0.0);
+        setQuery("query.is_in_water", entity.isInWater() ? 1.0 : 0.0);
+        setQuery("query.is_in_water_or_rain", entity.isInWaterRainOrBubble() ? 1.0 : 0.0);
+        setQuery("query.is_gliding", entity.isFallFlying() ? 1.0 : 0.0);
+        setQuery("query.is_on_fire", entity.isOnFire() ? 1.0 : 0.0);
+        setQuery("query.is_playing_dead", entity.isDeadOrDying() ? 1.0 : 0.0);
+        setQuery("query.is_spectator", entity instanceof Player player && player.isSpectator() ? 1.0 : 0.0);
+        setQuery("query.is_using_item", entity.isUsingItem() ? 1.0 : 0.0);
+        setQuery("query.is_eating", entity.getUseItem().getUseAnimation() == net.minecraft.world.item.UseAnim.EAT ? 1.0 : 0.0);
+        setQuery("query.is_first_person", mc.options.getCameraType() == CameraType.FIRST_PERSON ? 1.0 : 0.0);
+        setQuery("query.item_in_use_duration", entity.getTicksUsingItem() / 20.0);
+        setQuery("query.item_max_use_duration", entity.getUseItem().getUseDuration() / 20.0);
+        setQuery("query.item_remaining_use_duration", entity.getUseItemRemainingTicks() / 20.0);
+        setQuery("query.walk_distance", (double) entity.moveDist);
+        setQuery("query.modified_distance_moved", (double) entity.walkDist);
+        setQuery("query.body_x_rotation", (double) entity.getXRot());
+        setQuery("query.body_y_rotation", (double) net.minecraft.util.Mth.wrapDegrees(entity.getYRot()));
+        setQuery("query.head_x_rotation", (double) netHeadYaw);
+        setQuery("query.head_y_rotation", (double) headPitch);
+        setQuery("query.cardinal_facing_2d", (double) entity.getDirection().get3DDataValue());
+        setQuery("query.time_of_day", (entity.level().getDayTime() % 24000L) / 24000.0);
+        setQuery("query.time_stamp", (double) entity.level().getDayTime());
+        setQuery("query.moon_phase", (double) entity.level().getMoonPhase());
+        setQuery("query.player_level", (double) (entity instanceof Player player ? player.experienceLevel : 0));
+        setQuery("query.has_rider", entity.isVehicle() ? 1.0 : 0.0);
+        setQuery("query.actor_count", 0.0);
         if (mc.gameRenderer != null && mc.gameRenderer.getMainCamera() != null) {
-            q.put("query.distance_from_camera", mc.gameRenderer.getMainCamera().getPosition().distanceTo(entity.position()));
+            setQuery("query.distance_from_camera", mc.gameRenderer.getMainCamera().getPosition().distanceTo(entity.position()));
         }
 
-        q.put("ysm.head_yaw", (double) netHeadYaw);
-        q.put("ysm.head_pitch", (double) headPitch);
-        q.put("ysm.has_mainhand", mainHand.isEmpty() ? 0.0 : 1.0);
-        q.put("ysm.has_offhand", offHand.isEmpty() ? 0.0 : 1.0);
-        q.put("ysm.has_helmet", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.HEAD).isEmpty() ? 0.0 : 1.0);
-        q.put("ysm.has_chest_plate", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).isEmpty() ? 0.0 : 1.0);
-        q.put("ysm.has_leggings", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.LEGS).isEmpty() ? 0.0 : 1.0);
-        q.put("ysm.has_boots", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.FEET).isEmpty() ? 0.0 : 1.0);
-        q.put("ysm.has_elytra", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).is(Items.ELYTRA) ? 1.0 : 0.0);
-        q.put("ysm.is_sleep", entity.getPose() == Pose.SLEEPING ? 1.0 : 0.0);
-        q.put("ysm.is_sneak", onGround && crouching ? 1.0 : 0.0);
-        q.put("ysm.is_passenger", entity.isPassenger() ? 1.0 : 0.0);
-        q.put("ysm.is_riptide", entity.isAutoSpinAttack() ? 1.0 : 0.0);
-        q.put("ysm.armor_value", (double) entity.getArmorValue());
-        q.put("ysm.hurt_time", (double) entity.hurtTime);
-        q.put("ysm.food_level", (double) (entity instanceof Player player ? player.getFoodData().getFoodLevel() : 20));
+        setQuery("ysm.head_yaw", (double) netHeadYaw);
+        setQuery("ysm.head_pitch", (double) headPitch);
+        setQuery("ysm.has_mainhand", mainHand.isEmpty() ? 0.0 : 1.0);
+        setQuery("ysm.has_offhand", offHand.isEmpty() ? 0.0 : 1.0);
+        setQuery("ysm.has_helmet", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.HEAD).isEmpty() ? 0.0 : 1.0);
+        setQuery("ysm.has_chest_plate", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).isEmpty() ? 0.0 : 1.0);
+        setQuery("ysm.has_leggings", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.LEGS).isEmpty() ? 0.0 : 1.0);
+        setQuery("ysm.has_boots", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.FEET).isEmpty() ? 0.0 : 1.0);
+        setQuery("ysm.has_elytra", entity.getItemBySlot(net.minecraft.world.entity.EquipmentSlot.CHEST).is(Items.ELYTRA) ? 1.0 : 0.0);
+        setQuery("ysm.is_sleep", entity.getPose() == Pose.SLEEPING ? 1.0 : 0.0);
+        setQuery("ysm.is_sneak", onGround && crouching ? 1.0 : 0.0);
+        setQuery("ysm.is_passenger", entity.isPassenger() ? 1.0 : 0.0);
+        setQuery("ysm.is_riptide", entity.isAutoSpinAttack() ? 1.0 : 0.0);
+        setQuery("ysm.armor_value", (double) entity.getArmorValue());
+        setQuery("ysm.hurt_time", (double) entity.hurtTime);
+        setQuery("ysm.food_level", (double) (entity instanceof Player player ? player.getFoodData().getFoodLevel() : 20));
 
         // TLM model-pack query: whether the maid's own backpack geometry is shown
         // (TLM exposes this as tlm.has_backpack = EntityMaid.hasBackpack(); the
         // model entry's "show_backpack": false additionally forces it to 0).
-        q.put("tlm.has_backpack",
+        setQuery("tlm.has_backpack",
                 model.tlmShowBackpack && entity instanceof com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid maid
                         && maid.hasBackpack() ? 1.0 : 0.0);
 
-        q.put("ctrl.idle", currentState.equals("idle") || currentState.equals("new_idle_empty") ? 1.0 : 0.0);
-        q.put("ctrl.run", currentState.equals("run") ? 1.0 : 0.0);
-        q.put("ctrl.walk", currentState.equals("walk") ? 1.0 : 0.0);
-        q.put("ctrl.playing_extra_animation", 0.0);
+        setQuery("ctrl.idle", currentState.equals("idle") || currentState.equals("new_idle_empty") ? 1.0 : 0.0);
+        setQuery("ctrl.run", currentState.equals("run") ? 1.0 : 0.0);
+        setQuery("ctrl.walk", currentState.equals("walk") ? 1.0 : 0.0);
+        setQuery("ctrl.playing_extra_animation", 0.0);
     }
 
     private static boolean isCreativeFlying(LivingEntity entity) {

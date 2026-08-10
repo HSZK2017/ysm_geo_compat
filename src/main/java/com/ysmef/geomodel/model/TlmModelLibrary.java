@@ -416,6 +416,9 @@ public final class TlmModelLibrary {
         if (!scriptAnims.isEmpty()) {
             try {
                 EFMeshJsonWriter.writeRuntimeJson(geoModel, scriptAnims, YSMMeshLibrary.getRuntimeFile("tlm/" + meshFile), showBackpack);
+                // compile the freshly written runtime JSON off-thread so the first
+                // maid draw finds the compiled scripts instead of compiling inline
+                YSMMeshLibrary.preloadRuntimeAsync(modelId);
             } catch (Exception e) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to write TLM runtime for {}: {}", modelId, e.toString());
             }

@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.*;
 
 /**
@@ -157,8 +158,7 @@ public class EFMeshJsonWriter {
 
         root.add("vertices", vertices);
 
-        Files.createDirectories(outFile.getParent());
-        Files.writeString(outFile, new GsonBuilder().create().toJson(root), StandardCharsets.UTF_8);
+        writeFileAtomic(outFile, new GsonBuilder().create().toJson(root).getBytes(StandardCharsets.UTF_8));
         return quadCount[0];
     }
 
@@ -201,8 +201,22 @@ public class EFMeshJsonWriter {
 
         root.add("animations", com.ysmef.geomodel.ysm.script.ScriptJson.animationsToJson(scriptAnims));
 
-        Files.createDirectories(runtimeFile.getParent());
-        Files.writeString(runtimeFile, new GsonBuilder().create().toJson(root), StandardCharsets.UTF_8);
+        writeFileAtomic(runtimeFile, new GsonBuilder().create().toJson(root).getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Write a file atomically (temp file + rename) so a concurrently reading
+     * resource reload or cache scan can never observe a half-written file.
+     */
+    static void writeFileAtomic(Path target, byte[] bytes) throws IOException {
+        Files.createDirectories(target.getParent());
+        Path tmp = target.resolveSibling(target.getFileName().toString() + ".tmp");
+        Files.write(tmp, bytes);
+        try {
+            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
+            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+        }
     }
 
     /**

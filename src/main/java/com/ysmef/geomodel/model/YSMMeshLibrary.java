@@ -6,6 +6,7 @@ import com.google.gson.JsonParser;
 import com.mojang.blaze3d.platform.NativeImage;
 import com.ysmef.geomodel.YSMGeoCompat;
 import com.ysmef.geomodel.config.YSMCompatConfig;
+import com.ysmef.geomodel.model.runtime.YSMRuntimeModel;
 import com.ysmef.geomodel.ysm.YsmModelPackage;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
@@ -18,6 +19,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -62,7 +65,7 @@ public class YSMMeshLibrary {
      * in a way that invalidates previously generated meshes (forces a one-time
      * full regeneration).
      */
-    private static final int GENERATOR_VERSION = 3;
+    private static final int GENERATOR_VERSION = 4;
 
     private static final String MESH_NAMESPACE = YSMGeoCompat.MODID;
 
@@ -83,11 +86,25 @@ public class YSMMeshLibrary {
 
     private static volatile boolean generated = false;
 
+    /**
+     * Background pool for runtime-script preloads (compiling a runtime model
+     * takes ~100ms for large models; doing it off the render thread keeps the
+     * first draw of a restored/converted model free of hitches).
+     */
+    private static final ExecutorService PRELOAD_POOL = Executors.newFixedThreadPool(
+            Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors())), runnable -> {
+                Thread thread = new Thread(runnable, "ysm-geo-preload");
+                thread.setDaemon(true);
+                return thread;
+            });
+
     /** Per-model conversion result produced by worker threads. */
-    private record TextureEntry(String textureName, ResourceLocation location, byte[] data, int[] info) {}
+    private record TextureEntry(String textureName, ResourceLocation location, byte[] data, int[] info,
+                                String hash, long size) {}
 
     private record ModelResult(String modelId, String meshId, int quads, long fingerprint,
                                long contentFingerprint, String defaultTextureRL,
+                               String meshHash, long meshSize, String runtimeHash, long runtimeSize,
                                List<TextureEntry> textures) {}
 
     /**
@@ -270,6 +287,11 @@ public class YSMMeshLibrary {
      * Restore previously generated results without touching the (encrypted)
      * model packages: mesh accessors come from the manifest, texture bytes are
      * read back from the texture cache written during the last generation.
+     *
+     * Every model's generated outputs (mesh JSON, runtime JSON, cached texture
+     * bytes) are verified against the SHA-256 hashes recorded in the manifest
+     * before the cache is trusted; a broken/stale cache forces a regeneration
+     * instead of being trusted forever (the cause of permanently missing faces).
      */
     private static void loadFromCache() {
         long start = System.nanoTime();
@@ -288,6 +310,14 @@ public class YSMMeshLibrary {
                 String modelId = entry.getKey();
                 JsonObject modelEntry = entry.getValue().getAsJsonObject();
                 String meshId = modelEntry.get("mesh").getAsString();
+
+                if (!verifyModelOutputs(modelEntry)) {
+                    YSMGeoCompat.LOGGER.warn(
+                            "YSM-GEO Compat: cached outputs of model '{}' failed integrity verification, regenerating all meshes", modelId);
+                    generated = false;
+                    generateAll();
+                    return;
+                }
 
                 Meshes.MeshAccessor<YSMMesh> accessor = Meshes.MeshAccessor.create(
                         MESH_NAMESPACE, "entity/" + meshId,
@@ -316,6 +346,7 @@ public class YSMMeshLibrary {
                 }
             }
             generated = true;
+            preloadAllAsync();
             YSMGeoCompat.LOGGER.info(
                     "YSM-GEO Compat: all {} YSM models already converted, restored meshes and {} textures from cache in {} ms (no recompute needed)",
                     MESHES.size(), textures, (System.nanoTime() - start) / 1_000_000L);
@@ -324,6 +355,92 @@ public class YSMMeshLibrary {
             generated = false;
             generateAll();
         }
+    }
+
+    /**
+     * Verify every generated output of one model (mesh JSON, runtime JSON and
+     * cached texture bytes) against the manifest hashes/sizes.
+     */
+    private static boolean verifyModelOutputs(JsonObject modelEntry) {
+        try {
+            String meshName = modelEntry.get("mesh").getAsString();
+            if (!modelEntry.has("mhash") || !modelEntry.has("msize")
+                    || !modelEntry.has("rhash") || !modelEntry.has("rsize")) {
+                return false;
+            }
+            if (!hashMatches(MESH_DIR.resolve(meshName + ".json"),
+                    modelEntry.get("msize").getAsLong(), modelEntry.get("mhash").getAsString())) {
+                return false;
+            }
+            if (!hashMatches(RUNTIME_DIR.resolve(meshName + ".json"),
+                    modelEntry.get("rsize").getAsLong(), modelEntry.get("rhash").getAsString())) {
+                return false;
+            }
+            if (modelEntry.has("textures") && modelEntry.get("textures").isJsonObject()) {
+                for (Map.Entry<String, JsonElement> texEntry : modelEntry.getAsJsonObject("textures").entrySet()) {
+                    JsonObject tex = texEntry.getValue().getAsJsonObject();
+                    if (!tex.has("rl") || !tex.has("hash") || !tex.has("size")) {
+                        return false;
+                    }
+                    Path cacheFile = textureCachePath(ResourceLocation.parse(tex.get("rl").getAsString()));
+                    if (!hashMatches(cacheFile, tex.get("size").getAsLong(), tex.get("hash").getAsString())) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static boolean hashMatches(Path file, long expectedSize, String expectedHash) {
+        try {
+            if (!Files.isRegularFile(file) || Files.size(file) != expectedSize) {
+                return false;
+            }
+            return sha256Hex(file).equals(expectedHash);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private static String sha256Hex(Path file) throws IOException {
+        return sha256Hex(Files.readAllBytes(file));
+    }
+
+    private static String sha256Hex(byte[] data) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(data);
+            StringBuilder sb = new StringBuilder(hash.length * 2);
+            for (byte b : hash) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                sb.append(Character.forDigit(b & 0xF, 16));
+            }
+            return sb.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
+    /**
+     * Compile the freshly written/restored runtime JSONs on the background pool
+     * so the first draw of each model finds the compiled scripts instead of
+     * compiling (potentially ~100ms for big models) on the render thread.
+     */
+    private static void preloadAllAsync() {
+        for (String modelId : MESHES.keySet()) {
+            PRELOAD_POOL.submit(() -> YSMRuntimeModel.preload(modelId));
+        }
+    }
+
+    /**
+     * Submit the runtime script compilation of one model to the background pool
+     * (used by TLM model registration, which is not part of the YSM mesh set).
+     */
+    public static void preloadRuntimeAsync(String modelId) {
+        PRELOAD_POOL.submit(() -> YSMRuntimeModel.preload(modelId));
     }
 
     /**
@@ -389,6 +506,10 @@ public class YSMMeshLibrary {
                 modelEntry.addProperty("sig", result.fingerprint());
                 modelEntry.addProperty("csig", result.contentFingerprint());
                 modelEntry.addProperty("mesh", result.meshId());
+                modelEntry.addProperty("mhash", result.meshHash());
+                modelEntry.addProperty("msize", result.meshSize());
+                modelEntry.addProperty("rhash", result.runtimeHash());
+                modelEntry.addProperty("rsize", result.runtimeSize());
                 JsonObject texturesObj = new JsonObject();
                 for (TextureEntry tex : result.textures()) {
                     JsonObject texObj = new JsonObject();
@@ -398,6 +519,8 @@ public class YSMMeshLibrary {
                         texObj.addProperty("h", tex.info()[1]);
                         texObj.addProperty("fmt", tex.info()[2]);
                     }
+                    texObj.addProperty("hash", tex.hash());
+                    texObj.addProperty("size", tex.size());
                     texturesObj.add(tex.textureName(), texObj);
                 }
                 modelEntry.add("textures", texturesObj);
@@ -425,6 +548,11 @@ public class YSMMeshLibrary {
         writeManifest(manifestModels);
 
         generated = true;
+        // the runtime JSONs on disk changed: drop the compiled runtime models and
+        // per-entity animators, then compile the new runtime JSONs off-thread
+        YSMRuntimeModel.invalidateAll();
+        YSMRuntimeModel.clearAnimators();
+        preloadAllAsync();
         YSMGeoCompat.LOGGER.info(
                 "YSM-GEO Compat: generated {} base meshes from {} YSM model packages on {} threads in {} ms",
                 converted, models.size(), threadCount, (System.nanoTime() - start) / 1_000_000L);
@@ -447,8 +575,9 @@ public class YSMMeshLibrary {
             for (Map.Entry<String, byte[]> entry : pkg.textures.entrySet()) {
                 ResourceLocation rl = textureLocation(modelId, entry.getKey());
                 int[] info = pkg.textureInfo.get(entry.getKey());
-                writeTextureCache(rl, entry.getValue());
-                textures.add(new TextureEntry(entry.getKey(), rl, entry.getValue(), info));
+                byte[] data = entry.getValue();
+                writeTextureCache(rl, data);
+                textures.add(new TextureEntry(entry.getKey(), rl, data, info, sha256Hex(data), data.length));
             }
             String defaultTextureRL = defaultTextureOf(modelId, pkg);
 
@@ -461,8 +590,14 @@ public class YSMMeshLibrary {
                 return null;
             }
 
+            String meshHash = sha256Hex(outFile);
+            long meshSize = Files.size(outFile);
+            String runtimeHash = sha256Hex(runtimeFile);
+            long runtimeSize = Files.size(runtimeFile);
+
             return new ModelResult(modelId, meshId, quads, YsmModelPackage.fingerprint(modelId),
-                    YsmModelPackage.contentFingerprint(modelId), defaultTextureRL, textures);
+                    YsmModelPackage.contentFingerprint(modelId), defaultTextureRL,
+                    meshHash, meshSize, runtimeHash, runtimeSize, textures);
         } catch (Exception e) {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to convert model {}", modelId, e);
             return null;
@@ -503,8 +638,7 @@ public class YSMMeshLibrary {
     private static void writeTextureCache(ResourceLocation rl, byte[] data) {
         try {
             Path cacheFile = textureCachePath(rl);
-            Files.createDirectories(cacheFile.getParent());
-            Files.write(cacheFile, data);
+            EFMeshJsonWriter.writeFileAtomic(cacheFile, data);
         } catch (IOException e) {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to cache texture bytes for {}", rl);
         }
@@ -515,8 +649,7 @@ public class YSMMeshLibrary {
             JsonObject manifest = new JsonObject();
             manifest.addProperty("generator", GENERATOR_VERSION);
             manifest.add("models", manifestModels);
-            Files.createDirectories(MANIFEST.getParent());
-            Files.writeString(MANIFEST, new com.google.gson.GsonBuilder().create().toJson(manifest), StandardCharsets.UTF_8);
+            EFMeshJsonWriter.writeFileAtomic(MANIFEST, new com.google.gson.GsonBuilder().create().toJson(manifest).getBytes(StandardCharsets.UTF_8));
         } catch (IOException e) {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to write generation manifest", e);
         }

@@ -295,6 +295,7 @@ Writing Output: E:\program\JAVA\move\ysm_geo_model\build\reobfJar\output.jar
   com/ysmef/geomodel/ysm/YsmFileCrypto.class
   com/ysmef/geomodel/ysm/YsmModelPackage.class
   com/ysmef/geomodel/ysm/script/
+  com/ysmef/geomodel/ysm/script/Molang$1.class
   com/ysmef/geomodel/ysm/script/Molang$CoalesceExpr.class
   com/ysmef/geomodel/ysm/script/Molang$Env.class
   com/ysmef/geomodel/ysm/script/Molang$Expr.class

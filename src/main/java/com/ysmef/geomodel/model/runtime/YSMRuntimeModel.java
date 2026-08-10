@@ -45,13 +45,17 @@ public final class YSMRuntimeModel {
         public final Matrix4f bindWorld = new Matrix4f();
         public final Matrix4f bindLocal = new Matrix4f();
         public final Matrix4f bindLocalInv = new Matrix4f();
+        public final Matrix4f bindWorldInv = new Matrix4f();
     }
 
+    public final String modelId;
     final BoneRt[] bones;
     final Map<String, Integer> boneIndex;
     final List<CompiledAnim> parallels;
     final Map<String, CompiledAnim> states;
     final Map<String, CompiledAnim> conditionAnims;
+    /** Number of compiled keyframe channels; used to size per-animator cursor arrays. */
+    final int channelCount;
 
     /**
      * TLM model-pack entries may forbid the model's own backpack geometry
@@ -62,25 +66,87 @@ public final class YSMRuntimeModel {
 
     private final Map<UUID, YSMPlayerAnimator> animators = new ConcurrentHashMap<>();
 
-    private YSMRuntimeModel(BoneRt[] bones, Map<String, Integer> boneIndex,
+    /**
+     * Last tick each animator was used (entity.tickCount), used to sweep
+     * animators of entities that left the world / stopped being rendered, so a
+     * big model's per-player evaluator state (hundreds of KB for large models)
+     * does not accumulate for every player that ever used it.
+     */
+    private final Map<UUID, Integer> animatorLastTick = new ConcurrentHashMap<>();
+
+    /** Sweep cadence: scan at most every 15 s. */
+    private static final int ANIMATOR_SWEEP_INTERVAL_TICKS = 300;
+    /** Drop animators unused for more than 60 s. */
+    private static final int ANIMATOR_TTL_TICKS = 1200;
+    private static volatile int lastSweepTick = -1;
+    private static final java.util.concurrent.atomic.AtomicBoolean SWEEP_IN_PROGRESS = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    private YSMRuntimeModel(String modelId, BoneRt[] bones, Map<String, Integer> boneIndex,
                             List<CompiledAnim> parallels, Map<String, CompiledAnim> states,
-                            Map<String, CompiledAnim> conditionAnims, boolean tlmShowBackpack) {
+                            Map<String, CompiledAnim> conditionAnims, boolean tlmShowBackpack,
+                            int channelCount) {
+        this.modelId = modelId;
         this.bones = bones;
         this.boneIndex = boneIndex;
         this.parallels = parallels;
         this.states = states;
         this.conditionAnims = conditionAnims;
         this.tlmShowBackpack = tlmShowBackpack;
+        this.channelCount = channelCount;
     }
 
     public YSMPlayerAnimator animatorFor(LivingEntity entity) {
-        return animators.computeIfAbsent(entity.getUUID(), id -> new YSMPlayerAnimator(this));
+        UUID uuid = entity.getUUID();
+        int tick = entity.tickCount;
+        animatorLastTick.put(uuid, tick);
+        YSMPlayerAnimator animator = animators.get(uuid);
+        if (animator == null) {
+            animator = new YSMPlayerAnimator(this);
+            animators.put(uuid, animator);
+        }
+        sweepIfDue(tick);
+        return animator;
+    }
+
+    /** Periodically drop stale per-player animators (see {@link #ANIMATOR_TTL_TICKS}). */
+    private static void sweepIfDue(int tick) {
+        int last = lastSweepTick;
+        if (tick - last < ANIMATOR_SWEEP_INTERVAL_TICKS) {
+            return;
+        }
+        if (!SWEEP_IN_PROGRESS.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            lastSweepTick = tick;
+            java.util.List<YSMRuntimeModel> models;
+            synchronized (CACHE) {
+                models = new ArrayList<>(CACHE.values());
+            }
+            for (YSMRuntimeModel model : models) {
+                model.sweepAnimators(tick);
+            }
+        } finally {
+            SWEEP_IN_PROGRESS.set(false);
+        }
+    }
+
+    private void sweepAnimators(int nowTick) {
+        java.util.Iterator<Map.Entry<UUID, Integer>> it = animatorLastTick.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<UUID, Integer> entry = it.next();
+            if (nowTick - entry.getValue() > ANIMATOR_TTL_TICKS) {
+                it.remove();
+                animators.remove(entry.getKey());
+            }
+        }
     }
 
     public static void clearAnimators() {
         synchronized (CACHE) {
             for (YSMRuntimeModel model : CACHE.values()) {
                 model.animators.clear();
+                model.animatorLastTick.clear();
             }
         }
     }
@@ -195,21 +261,23 @@ public final class YSMRuntimeModel {
 
     private static Molang.Env newDefaultEnv() {
         return new Molang.Env() {
-            private final Map<String, Double> vars = new HashMap<>();
+            private final Map<Integer, Double> vars = new HashMap<>();
+            private final Set<Integer> varSet = new HashSet<>();
 
             @Override
-            public double getVar(String path) {
-                return vars.getOrDefault(path, 0.0);
+            public double getVarById(int id) {
+                return varSet.contains(id) ? vars.getOrDefault(id, 0.0) : 0.0;
             }
 
             @Override
-            public boolean hasVar(String path) {
-                return vars.containsKey(path);
+            public boolean hasVarById(int id) {
+                return varSet.contains(id);
             }
 
             @Override
-            public void setVar(String path, double value) {
-                vars.put(path, value);
+            public void setVarById(int id, double value) {
+                vars.put(id, value);
+                varSet.add(id);
             }
 
             /**
@@ -221,21 +289,14 @@ public final class YSMRuntimeModel {
              * the default form rendered during Epic Fight combat animations.
              */
             @Override
-            public double getQuery(String path) {
-                if (path.startsWith("q.")) {
-                    path = "query." + path.substring(2);
+            public double getQueryById(int id) {
+                if (id == Q_HEALTH || id == Q_MAX_HEALTH) {
+                    return 20.0;
                 }
-                switch (path) {
-                    case "query.health":
-                    case "query.max_health":
-                        return 20.0;
-                    case "query.is_on_ground":
-                    case "query.is_alive":
-                    case "ctrl.idle":
-                        return 1.0;
-                    default:
-                        return 0.0;
+                if (id == Q_ON_GROUND || id == Q_ALIVE || id == Q_IDLE) {
+                    return 1.0;
                 }
+                return 0.0;
             }
 
             @Override
@@ -250,40 +311,120 @@ public final class YSMRuntimeModel {
         };
     }
 
+    private static final int Q_HEALTH = Molang.idOf("query.health");
+    private static final int Q_MAX_HEALTH = Molang.idOf("query.max_health");
+    private static final int Q_ON_GROUND = Molang.idOf("query.is_on_ground");
+    private static final int Q_ALIVE = Molang.idOf("query.is_alive");
+    private static final int Q_IDLE = Molang.idOf("ctrl.idle");
+
     // ------------------------------------------------------------------
     // Loading / compilation
     // ------------------------------------------------------------------
 
     private static final Map<String, YSMRuntimeModel> CACHE = new HashMap<>();
-    private static final Map<String, Long> CACHE_MTIME = new HashMap<>();
 
-    /** Get the compiled runtime model for a model id, or null if unavailable. */
+    /** Models whose runtime JSON is being compiled on a background thread. */
+    private static final Set<String> PRELOADING = ConcurrentHashMap.newKeySet();
+
+    /** Incremented on invalidateAll: stale background compiles drop their results. */
+    private static final java.util.concurrent.atomic.AtomicInteger RELOAD_GENERATION = new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
+     * Get the compiled runtime model for a model id, or null if unavailable.
+     *
+     * No per-call disk stat: staleness is handled explicitly by the caller.
+     * YSMMeshLibrary / TlmModelLibrary call {@link #invalidate(String)} /
+     * {@link #invalidateAll()} after (re)converting models, and the reload
+     * paths call {@link #invalidateAll()}; without those the compiled model is
+     * cached for the session. (Previously the file mtime was re-read on every
+     * call - a disk stat per player per frame.)
+     *
+     * The compile normally runs on a background thread ({@link #preload(String)},
+     * started when the mesh is registered); while it is in flight this returns
+     * null so the render thread never blocks on the compile, and the caller
+     * renders the un-evaluated fallback for a few frames instead of hitching.
+     */
     public static YSMRuntimeModel get(String modelId) {
-        Path file = runtimeFileOf(modelId);
-        long mtime;
-        try {
-            mtime = Files.getLastModifiedTime(file).toMillis();
-        } catch (Exception e) {
-            return null;
-        }
         synchronized (CACHE) {
-            Long cachedMtime = CACHE_MTIME.get(modelId);
-            if (cachedMtime != null && cachedMtime == mtime) {
+            if (CACHE.containsKey(modelId)) {
                 return CACHE.get(modelId);
             }
-            try {
-                String json = Files.readString(file);
-                YSMRuntimeModel model = compile(JsonParser.parseString(json).getAsJsonObject());
-                CACHE.put(modelId, model);
-                CACHE_MTIME.put(modelId, mtime);
-                return model;
-            } catch (Exception e) {
-                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to load runtime model '{}': {}", modelId, e.toString());
-                CACHE.put(modelId, null);
-                CACHE_MTIME.put(modelId, mtime);
-                return null;
+        }
+        if (PRELOADING.contains(modelId)) {
+            return null;
+        }
+        return loadAndCache(modelId);
+    }
+
+    /**
+     * Background preload: compile the runtime model off the render thread.
+     * Called right after the runtime JSON was written (conversion / cache
+     * restore), so the first draw finds the compiled model instead of
+     * compiling inline (potentially ~100ms for big models).
+     *
+     * Deduplicated via {@link #PRELOADING}; the result is only cached when the
+     * task is still the current one (reloads/re-conversions drop stale results,
+     * the next {@link #get} then compiles synchronously as the fallback).
+     */
+    public static void preload(String modelId) {
+        synchronized (CACHE) {
+            if (CACHE.containsKey(modelId)) {
+                return;
             }
         }
+        if (!PRELOADING.add(modelId)) {
+            return;
+        }
+        int generation = RELOAD_GENERATION.get();
+        try {
+            YSMRuntimeModel model = loadAndCompile(modelId);
+            if (PRELOADING.remove(modelId) && generation == RELOAD_GENERATION.get()) {
+                synchronized (CACHE) {
+                    CACHE.put(modelId, model);
+                }
+            }
+        } catch (Throwable t) {
+            PRELOADING.remove(modelId);
+        }
+    }
+
+    private static YSMRuntimeModel loadAndCache(String modelId) {
+        synchronized (CACHE) {
+            if (CACHE.containsKey(modelId)) {
+                return CACHE.get(modelId);
+            }
+            YSMRuntimeModel model = loadAndCompile(modelId);
+            CACHE.put(modelId, model);
+            return model;
+        }
+    }
+
+    private static YSMRuntimeModel loadAndCompile(String modelId) {
+        Path file = runtimeFileOf(modelId);
+        try {
+            String json = Files.readString(file);
+            return compile(modelId, JsonParser.parseString(json).getAsJsonObject());
+        } catch (Exception e) {
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to load runtime model '{}': {}", modelId, e.toString());
+            return null;
+        }
+    }
+
+    /** Forget one cached runtime model (called after its mesh was (re)converted). */
+    public static void invalidate(String modelId) {
+        synchronized (CACHE) {
+            CACHE.remove(modelId);
+        }
+        PRELOADING.remove(modelId);
+    }
+
+    /** Forget all cached runtime models (called when meshes are regenerated). */
+    public static void invalidateAll() {
+        synchronized (CACHE) {
+            CACHE.clear();
+        }
+        PRELOADING.clear();
+        RELOAD_GENERATION.incrementAndGet();
     }
 
     /**
@@ -317,15 +458,7 @@ public final class YSMRuntimeModel {
         out.add(YSMMeshLibrary.getRuntimeFile("tlm/" + meshId));
     }
 
-    /** Forget all cached runtime models (called when meshes are regenerated). */
-    public static void invalidateAll() {
-        synchronized (CACHE) {
-            CACHE.clear();
-            CACHE_MTIME.clear();
-        }
-    }
-
-    private static YSMRuntimeModel compile(JsonObject root) {
+    private static YSMRuntimeModel compile(String modelId, JsonObject root) {
         // bones
         JsonArray bonesArr = root.getAsJsonArray("bones");
         Map<String, BoneRt> byName = new LinkedHashMap<>();
@@ -367,6 +500,7 @@ public final class YSMRuntimeModel {
         BoneRt[] bones = boneList.toArray(new BoneRt[0]);
         for (int i = 0; i < bones.length; i++) {
             computeBindWorld(bones, i);
+            bones[i].bindWorldInv.set(bones[i].bindWorld).invert();
         }
 
         // animations
@@ -375,6 +509,7 @@ public final class YSMRuntimeModel {
         Map<String, CompiledAnim> conditions = new HashMap<>();
         Set<String> brokenAnims = new HashSet<>();
         JsonObject anims = root.has("animations") ? root.getAsJsonObject("animations") : null;
+        int nextChannelId = 0;
         if (anims != null) {
             for (Map.Entry<String, JsonElement> entry : anims.entrySet()) {
                 String name = entry.getKey();
@@ -387,6 +522,7 @@ public final class YSMRuntimeModel {
                     } else {
                         states.put(name, anim);
                     }
+                    nextChannelId = assignChannelIds(anim, nextChannelId);
                 } catch (Exception e) {
                     // One broken molang animation must not disable variant visibility
                     // for the whole model (that would render every variant at once).
@@ -400,7 +536,27 @@ public final class YSMRuntimeModel {
         parallels.sort(Comparator.comparing((CompiledAnim a) -> a.name.startsWith("pre_parallel") ? 0 : 1)
                 .thenComparing(a -> a.name));
         boolean tlmShowBackpack = !root.has("tlm_show_backpack") || root.get("tlm_show_backpack").getAsBoolean();
-        return new YSMRuntimeModel(bones, boneIndex, parallels, states, conditions, tlmShowBackpack);
+        return new YSMRuntimeModel(modelId, bones, boneIndex, parallels, states, conditions, tlmShowBackpack, nextChannelId);
+    }
+
+    /**
+     * Assign sequential channel ids to every keyframe channel of an animation
+     * (rot/pos/scale per animated bone). Ids are unique per model and index the
+     * per-animator incremental keyframe cursors (see YSMPlayerAnimator).
+     */
+    private static int assignChannelIds(CompiledAnim anim, int nextId) {
+        for (CompiledChannels channels : anim.bones.values()) {
+            if (channels.rot != null) {
+                channels.rot.channelId = nextId++;
+            }
+            if (channels.pos != null) {
+                channels.pos.channelId = nextId++;
+            }
+            if (channels.scale != null) {
+                channels.scale.channelId = nextId++;
+            }
+        }
+        return nextId;
     }
 
     private static boolean isConditionAnim(String name) {
@@ -443,6 +599,7 @@ public final class YSMRuntimeModel {
     }
 
     public static final class CompiledChannel {
+        public int channelId;
         public float[] times;
         public int[] lerps;
         public Molang.Expr[][] post;   // [key][axis]
