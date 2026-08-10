@@ -8,8 +8,6 @@ public class YSMCompatConfig {
 
     public static final ForgeConfigSpec CLIENT_SPEC;
 
-    public static final ForgeConfigSpec.BooleanValue DEBUG_LOG_CONVERSION;
-
     /** Async script evaluation for entities other than the local player. */
     public static final ForgeConfigSpec.BooleanValue ENABLE_SCRIPT_ASYNC_EVAL;
 
@@ -17,10 +15,6 @@ public class YSMCompatConfig {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
 
         builder.comment("YSM GEO Compat - Client Configuration").push("client");
-
-        DEBUG_LOG_CONVERSION = builder
-                .comment("Log detailed conversion info to console (for debugging)")
-                .define("debugLogConversion", false);
 
         ENABLE_SCRIPT_ASYNC_EVAL = builder
                 .comment("Evaluate molang scripts of entities other than the local player on a background thread (double-buffered), keeping the render thread free")

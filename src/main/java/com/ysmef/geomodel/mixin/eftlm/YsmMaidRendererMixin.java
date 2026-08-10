@@ -27,6 +27,13 @@ import yesman.epicfight.client.mesh.HumanoidMesh;
  * WineFox family) and take precedence; the converted mesh is substituted only
  * for models EFTLM does not cover, replacing EFTLM's generic default mesh.
  *
+ * Maids using a YSM model (EntityMaid#isYsmModel) are yielded to the
+ * YSM_EpicFight_Compat mod: this handler returns without touching the return
+ * value so YSMEF's own injector on this method (when installed) handles them.
+ * This keeps the two mods' injectors mutually exclusive - each maid's mesh is
+ * set by exactly one mod - avoiding double setReturnValue on the same
+ * CallbackInfoReturnable.
+ *
  * Lives in the optional eftlm mixin config (required:false) so the mod still
  * loads when EpicFight_TouhouLittleMaid is absent.
  */
@@ -35,10 +42,15 @@ public abstract class YsmMaidRendererMixin {
 
     @Inject(method = "getMeshProvider(Lnet/EFTLM/EF/Capability/MaidPatch;)Lyesman/epicfight/api/asset/AssetAccessor;",
             at = @At("HEAD"), cancellable = true, remap = false)
-    private void ysmef$useYsmMesh(MaidPatch<EntityMaid> maidPatch,
+    private void ysmef$useTlmMesh(MaidPatch<EntityMaid> maidPatch,
                                   CallbackInfoReturnable<AssetAccessor<MaidMesh>> cir) {
         EntityMaid maid = maidPatch.getOriginal();
         if (maid == null) {
+            return;
+        }
+        if (maid.isYsmModel()) {
+            // YSM-model maids belong to YSM_EpicFight_Compat (when installed);
+            // leave the return value untouched so its injector wins.
             return;
         }
         String modelId = maidPatch.getModelID();

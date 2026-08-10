@@ -11,17 +11,16 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Bridge between Touhou Little Maid entities and the YSM/TLM mesh libraries.
+ * Bridge between Touhou Little Maid entities and the TLM mesh library.
  *
- * A maid's model comes from one of two sources, both covered:
- * - a YSM model (TLM's YSM integration; the selection lives in synced entity
- *   data, readable directly on the client) -> converted YSM base mesh
- * - a TLM model pack GEO model (EntityMaid#getModelId, also synced) -> converted
- *   TLM base mesh (see TlmModelLibrary)
+ * A maid's TLM model-pack GEO model (EntityMaid#getModelId, synced entity data)
+ * is converted to an Epic Fight base mesh (see TlmModelLibrary). When such a
+ * maid is rendered through Epic Fight's pipeline (EpicFight_TouhouLittleMaid's
+ * patched renderer), the converted mesh for her model is substituted.
  *
- * When such a maid is rendered through Epic Fight's pipeline
- * (EpicFight_TouhouLittleMaid's patched renderer), the converted mesh for her
- * model is substituted.
+ * Maids using a YSM model (TLM's YSM integration, EntityMaid#isYsmModel) are
+ * NOT handled here: the caller (YsmMaidRendererMixin) yields those to
+ * YSM_EpicFight_Compat, which renders them with its own converted YSM meshes.
  *
  * This class is only referenced when EpicFight_TouhouLittleMaid is installed
  * (the maid renderer mixin lives in the optional eftlm mixin config).
@@ -33,28 +32,19 @@ public final class YsmMaidMeshSupport {
     private YsmMaidMeshSupport() {}
 
     /**
-     * Select the converted base mesh for the maid's current model (YSM or TLM
-     * GEO), or null when her model has no converted mesh, leaving
+     * Select the converted base mesh for the maid's current TLM model-pack GEO
+     * model, or null when her model has no converted mesh, leaving
      * EpicFight_TouhouLittleMaid's own mesh selection in place.
      */
     public static AssetAccessor<HumanoidMesh> selectMaidMesh(EntityMaid maid) {
-        if (maid == null) {
+        if (maid == null || maid.isYsmModel()) {
             return null;
-        }
-        if (maid.isYsmModel()) {
-            logHookActiveOnce(maid.getYsmModelId(), true);
-            String modelId = maid.getYsmModelId();
-            if (modelId == null || modelId.isEmpty()) {
-                return null;
-            }
-            String texture = maid.getYsmModelTexture();
-            return YSMMeshSelector.selectMeshForModel(maid, modelId, texture, maid.getName().getString());
         }
         String tlmModelId = maid.getModelId();
         if (tlmModelId == null || tlmModelId.isEmpty()) {
             return null;
         }
-        logHookActiveOnce(tlmModelId, false);
+        logHookActiveOnce(tlmModelId);
         TlmModelLibrary.ensureGenerated();
         TlmModelLibrary.TlmMeshEntry entry = TlmModelLibrary.find(tlmModelId);
         if (entry == null) {
@@ -69,11 +59,10 @@ public final class YsmMaidMeshSupport {
      * One-time proof that the maid renderer hook actually fires in-game (if this
      * line never appears in the log, the mixin did not apply).
      */
-    private static void logHookActiveOnce(String modelId, boolean ysmModel) {
+    private static void logHookActiveOnce(String modelId) {
         if (LOGGED.add("hook-active")) {
             YSMGeoCompat.LOGGER.info(
-                    "YSM-GEO Compat: maid mesh hook active (first maid model='{}', ysm={})",
-                    modelId, ysmModel);
+                    "YSM-GEO Compat: maid mesh hook active (first maid model='{}')", modelId);
         }
     }
 

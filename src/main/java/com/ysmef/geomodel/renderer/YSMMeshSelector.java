@@ -4,7 +4,6 @@ import com.ysmef.geomodel.YSMGeoCompat;
 import com.ysmef.geomodel.model.YSMMesh;
 import com.ysmef.geomodel.model.YSMMeshLibrary;
 import com.ysmef.geomodel.model.runtime.YSMRuntimeBridge;
-import net.minecraft.client.player.AbstractClientPlayer;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.world.entity.LivingEntity;
 import yesman.epicfight.api.asset.AssetAccessor;
@@ -15,56 +14,18 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Shared mesh-selection logic used by the patched renderer override, the mixin
- * that hijacks Epic Fight's own PPlayerRenderer#getMeshProvider, and the
- * EpicFight_TouhouLittleMaid maid renderer hook.
+ * Shared mesh-selection logic used by the EpicFight_TouhouLittleMaid maid
+ * renderer hook.
  *
- * Returns a mesh accessor for the entity's current YSM model (with the texture
- * override applied), or null to let Epic Fight use its default mesh.
+ * Returns a mesh accessor for the maid's current TLM model-pack GEO model
+ * (with the texture override applied), or null to let Epic Fight use its
+ * default mesh.
  */
 public final class YSMMeshSelector {
 
     private static final Set<String> LOGGED_MESH_USE = ConcurrentHashMap.newKeySet();
-    private static final Set<String> LOGGED_MESH_MISSING = ConcurrentHashMap.newKeySet();
 
     private YSMMeshSelector() {}
-
-    /**
-     * Select the converted base mesh for the player's current YSM model.
-     *
-     * @return the mesh accessor, or null if no converted mesh exists for the model
-     */
-    public static AssetAccessor<HumanoidMesh> selectMesh(AbstractClientPlayer player) {
-        if (player == null) {
-            return null;
-        }
-        YSMModelAccess.YSMModelRef modelRef = YSMModelAccess.getCurrentModel(player);
-        if (modelRef == null) {
-            return null;
-        }
-        return selectMeshForModel(player, modelRef.modelId(), modelRef.textureName(),
-                player.getGameProfile().getName());
-    }
-
-    /**
-     * Select the converted base mesh for an explicitly given YSM model + texture
-     * (used for maids, whose current YSM model id is read from synced entity data).
-     *
-     * @return the mesh accessor, or null if no converted mesh exists for the model
-     */
-    public static AssetAccessor<HumanoidMesh> selectMeshForModel(LivingEntity entity, String modelId,
-                                                                 String textureName, String displayName) {
-        if (entity == null || modelId == null || modelId.isEmpty()) {
-            return null;
-        }
-        Meshes.MeshAccessor<YSMMesh> accessor = YSMMeshLibrary.findMesh(modelId);
-        if (accessor == null) {
-            logMeshMissingOnce(entity, modelId, textureName, displayName);
-            return null;
-        }
-        ResourceLocation texture = YSMMeshLibrary.findTexture(modelId, textureName);
-        return selectResolvedMesh(entity, accessor, modelId, texture, textureName, displayName);
-    }
 
     /**
      * Shared core: apply the runtime model id, current entity and texture
@@ -104,17 +65,8 @@ public final class YSMMeshSelector {
         String key = entity.getUUID() + "|" + modelId + "|" + textureName;
         if (LOGGED_MESH_USE.add(key)) {
             YSMGeoCompat.LOGGER.info(
-                    "YSM-GEO Compat: rendering '{}' with converted YSM base mesh (model='{}', texture='{}' -> {})",
+                    "YSM-GEO Compat: rendering '{}' with converted TLM base mesh (model='{}', texture='{}' -> {})",
                     displayName, modelId, textureName, texture);
-        }
-    }
-
-    private static void logMeshMissingOnce(LivingEntity entity, String modelId, String textureName, String displayName) {
-        String key = entity.getUUID() + "|" + modelId;
-        if (LOGGED_MESH_MISSING.add(key)) {
-            YSMGeoCompat.LOGGER.warn(
-                    "YSM-GEO Compat: no converted base mesh for model '{}' (entity '{}', texture '{}'). Falling back to Epic Fight default mesh. Available: {}",
-                    modelId, displayName, textureName, YSMMeshLibrary.availableModelIds());
         }
     }
 }

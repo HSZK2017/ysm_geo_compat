@@ -63,7 +63,6 @@ minecraft {
 
 mixin {
     add sourceSets.main, "${mod_id}.refmap.json"
-    config "${mod_id}.mixins.json"
     config "${mod_id}.eftlm.mixins.json"
 }
 
@@ -96,15 +95,9 @@ dependencies {
     // Touhou Little Maid + EpicFight_TouhouLittleMaid (optional maid compat)
     implementation fg.deobf("libs:touhoulittlemaid:${tlm_version}")
     implementation fg.deobf("libs:ef_tlm:${eftlm_version}")
-
-    // Zstandard decompression for YSM .ysm binary model packages (nested via Jar-in-Jar)
-    implementation "com.github.luben:zstd-jni:1.5.6-3"
-    jarJar "com.github.luben:zstd-jni:[1.5.6-3,1.5.6-3]"
 }
 
 jar.finalizedBy('reobfJar')
-
-jarJar.enable()
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'

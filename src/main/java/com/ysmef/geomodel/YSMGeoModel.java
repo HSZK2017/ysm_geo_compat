@@ -34,51 +34,9 @@ public class YSMGeoModel {
     public int textureHeight = 64;
 
     /**
-     * Build from a decrypted .ysm binary package (YsmBinaryReader output).
-     * Binary faces are already in the same bind-ready form as parsed quads:
-     * positions/normals pre-baked with cube rotations, UVs normalized.
-     * Bone pivots are in bedrock units (1/16 block) with x negated; rotations
-     * are radians with x/y negated, matching the JSON path conventions.
+     * Parses bedrock geometry JSON (used for TLM model-pack GEO models,
+     * including GeckoLib-format packs whose geometry section is bedrock-style).
      */
-    public static YSMGeoModel fromBinary(com.ysmef.geomodel.ysm.YsmBinaryReader.BinaryModel binary) {
-        YSMGeoModel model = new YSMGeoModel();
-        Map<String, Bone> byName = new HashMap<>();
-        for (com.ysmef.geomodel.ysm.YsmBinaryReader.BinaryBone binaryBone : binary.mainBones) {
-            Bone bone = new Bone();
-            bone.name = binaryBone.name;
-            bone.pivotX = binaryBone.pivotX / 16.0f;
-            bone.pivotY = binaryBone.pivotY / 16.0f;
-            bone.pivotZ = binaryBone.pivotZ / 16.0f;
-            bone.rotX = binaryBone.rotX;
-            bone.rotY = binaryBone.rotY;
-            bone.rotZ = binaryBone.rotZ;
-
-            for (com.ysmef.geomodel.ysm.YsmBinaryReader.BinaryFace binaryFace : binaryBone.faces) {
-                Vector3f[] positions = new Vector3f[4];
-                float[][] uvs = new float[4][2];
-                for (int i = 0; i < 4; i++) {
-                    positions[i] = new Vector3f(binaryFace.px[i], binaryFace.py[i], binaryFace.pz[i]);
-                    uvs[i] = new float[]{binaryFace.u[i], binaryFace.v[i]};
-                }
-                bone.quads.add(new Quad(positions, uvs, new Vector3f(binaryFace.nx, binaryFace.ny, binaryFace.nz)));
-            }
-            byName.put(bone.name, bone);
-            model.bonesByName.put(bone.name, bone);
-        }
-
-        for (com.ysmef.geomodel.ysm.YsmBinaryReader.BinaryBone binaryBone : binary.mainBones) {
-            Bone bone = byName.get(binaryBone.name);
-            Bone parent = binaryBone.parentName.isEmpty() ? null : byName.get(binaryBone.parentName);
-            if (parent != null) {
-                bone.parent = parent;
-                parent.children.add(bone);
-            } else {
-                model.topLevelBones.add(bone);
-            }
-        }
-        return model;
-    }
-
     public static YSMGeoModel parse(String json) {        JsonObject root = JsonParser.parseString(json).getAsJsonObject();
         JsonArray geometries = root.getAsJsonArray("minecraft:geometry");
         if (geometries == null || geometries.isEmpty()) {

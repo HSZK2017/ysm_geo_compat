@@ -4,8 +4,6 @@ import com.ysmef.geomodel.YSMGeoCompat;
 import com.ysmef.geomodel.model.TlmModelLibrary;
 import com.ysmef.geomodel.model.YSMMeshLibrary;
 import com.ysmef.geomodel.model.runtime.YSMRuntimeModel;
-import com.ysmef.geomodel.renderer.YSMModelAccess;
-import com.ysmef.geomodel.renderer.YSMPlayerRenderer;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.packs.PackType;
@@ -13,28 +11,19 @@ import net.minecraft.server.packs.PathPackResources;
 import net.minecraft.server.packs.repository.Pack;
 import net.minecraft.server.packs.repository.PackSource;
 import net.minecraft.server.packs.resources.ResourceManagerReloadListener;
-import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.client.event.RegisterClientReloadListenersEvent;
 import net.minecraftforge.event.AddPackFindersEvent;
-import net.minecraftforge.eventbus.api.EventPriority;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 import net.minecraftforge.fml.event.lifecycle.FMLClientSetupEvent;
-import yesman.epicfight.api.client.forgeevent.PatchedRenderersEvent;
 
 /**
  * Client-side registration:
- * - hooks the converted-mesh-aware patched renderer into Epic Fight's patched
- *   renderer registry
- * - registers the generated mesh resource pack (converted Epic Fight base meshes
- *   for every locally available model, see YSMMeshLibrary / TlmModelLibrary)
- * - triggers the base-mesh generation at client setup and refreshes it on reload
- *
- * Epic Fight's own player patches (Server/Remote/LocalPlayerPatch) are
- * intentionally left untouched: they already handle combat animations and decide
- * when Epic Fight takes over rendering.
+ * - registers the generated mesh resource pack (converted TLM maid meshes,
+ *   see TlmModelLibrary)
+ * - triggers the TLM mesh generation at client setup and refreshes it on reload
  */
 @Mod.EventBusSubscriber(
         modid = YSMGeoCompat.MODID,
@@ -42,19 +31,6 @@ import yesman.epicfight.api.client.forgeevent.PatchedRenderersEvent;
         value = Dist.CLIENT
 )
 public class YSMCompatClientEvents {
-
-    /**
-     * Register the converted-mesh-aware patched renderer for the player entity type.
-     * LOWEST priority so this registration wins over other Epic Fight addons.
-     */
-    @SubscribeEvent(priority = EventPriority.LOWEST)
-    public static void registerRenderer(PatchedRenderersEvent.Add event) {
-        event.addPatchedEntityRenderer(EntityType.PLAYER,
-                (entityType) -> new YSMPlayerRenderer(event.getContext(), entityType)
-                        .initLayerLast(event.getContext(), entityType));
-
-        YSMGeoCompat.LOGGER.info("YSM-GEO Compat: Registered YSMPlayerRenderer for Player entity");
-    }
 
     /**
      * Register the generated mesh folder as an always-on client resource pack, so
@@ -84,19 +60,12 @@ public class YSMCompatClientEvents {
     }
 
     /**
-     * Generate the Epic Fight base meshes for all locally available models
-     * (YSM model packages and TLM model pack maid models). Blocks until the
-     * first-time conversion has finished so the game cannot reach the main
-     * menu with half-generated meshes.
+     * Generate the Epic Fight base meshes for all locally available TLM model
+     * pack maid models (tlm_custom_pack + jar-builtin maid_model.json).
      */
     @SubscribeEvent
     public static void onClientSetup(FMLClientSetupEvent event) {
         event.enqueueWork(() -> {
-            try {
-                YSMMeshLibrary.ensureGeneratedBlocking();
-            } catch (Throwable t) {
-                YSMGeoCompat.LOGGER.error("YSM-GEO Compat: base mesh generation failed", t);
-            }
             try {
                 TlmModelLibrary.resetLazyGeneration();
                 TlmModelLibrary.generateAll(Minecraft.getInstance().getResourceManager());
@@ -112,14 +81,8 @@ public class YSMCompatClientEvents {
     @SubscribeEvent
     public static void onRegisterReloadListeners(RegisterClientReloadListenersEvent event) {
         event.registerReloadListener((ResourceManagerReloadListener) resourceManager -> {
-            YSMModelAccess.clearCache();
             YSMRuntimeModel.invalidateAll();
             YSMRuntimeModel.clearAnimators();
-            try {
-                YSMMeshLibrary.ensureGeneratedBlocking();
-            } catch (Throwable t) {
-                YSMGeoCompat.LOGGER.error("YSM-GEO Compat: base mesh regeneration failed", t);
-            }
             try {
                 TlmModelLibrary.resetLazyGeneration();
                 TlmModelLibrary.generateAll(resourceManager);

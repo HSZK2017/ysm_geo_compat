@@ -1,27 +1,23 @@
 package com.ysmef.geomodel.renderer;
 
 import net.minecraft.world.entity.LivingEntity;
-import net.minecraft.world.entity.player.Player;
 import yesman.epicfight.world.capabilities.EpicFightCapabilities;
 import yesman.epicfight.world.capabilities.entitypatch.LivingEntityPatch;
-import yesman.epicfight.world.capabilities.entitypatch.player.PlayerPatch;
 
 import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Central battle-mode check for the YSM-EF compat features.
+ * Central battle-mode check for the converted-mesh features.
  *
  * "Battle mode" means the state where Epic Fight plays its own combat animations
- * on the entity: for players that is PlayerPatch#isEpicFightMode; for other
- * patched entities (e.g. EpicFight_TouhouLittleMaid's MaidPatch) it is the
- * patch's isFightMode() method, looked up reflectively so this mod keeps no
- * compile-time dependency on those addons.
+ * on the entity: for EpicFight_TouhouLittleMaid's MaidPatch that is the patch's
+ * isFightMode() method, looked up reflectively so this mod keeps no compile-time
+ * dependency on that addon.
  *
- * In that state the compat mod renders the plain converted YSM base mesh only -
- * no compat script animations, no variant forms, no YSM mod rendering, no armor
- * models.
+ * In that state the compat mod renders the plain converted base mesh only -
+ * no script animations, no variant forms.
  */
 public final class YSMBattleMode {
 
@@ -32,27 +28,12 @@ public final class YSMBattleMode {
     private YSMBattleMode() {}
 
     /**
-     * True when the given player is currently in Epic Fight battle mode.
-     */
-    public static boolean isBattleMode(Player player) {
-        if (player == null) {
-            return false;
-        }
-        LivingEntityPatch<?> patch = EpicFightCapabilities.getEntityPatch(player, LivingEntityPatch.class);
-        return patch instanceof PlayerPatch<?> playerPatch && playerPatch.isEpicFightMode();
-    }
-
-    /**
-     * True when the given entity is currently in battle mode: players via
-     * PlayerPatch#isEpicFightMode, other entities via a reflective isFightMode()
-     * on their patch (e.g. EFTLM's MaidPatch).
+     * True when the given entity is currently in battle mode (reflective
+     * isFightMode() on its Epic Fight patch, e.g. EFTLM's MaidPatch).
      */
     public static boolean isBattleMode(LivingEntity entity) {
         if (entity == null) {
             return false;
-        }
-        if (entity instanceof Player player) {
-            return isBattleMode(player);
         }
         LivingEntityPatch<?> patch = EpicFightCapabilities.getEntityPatch(entity, LivingEntityPatch.class);
         if (patch == null) {

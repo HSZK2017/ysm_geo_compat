@@ -4,7 +4,6 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.ysmef.geomodel.YSMGeoModel;
-import com.ysmef.geomodel.ysm.YsmModelPackage;
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 
@@ -58,28 +57,6 @@ public class EFMeshJsonWriter {
                 Math.round(pos.x() * 1000f), Math.round(pos.y() * 1000f), Math.round(pos.z() * 1000f),
                 Math.round(normal.x() * 100f), Math.round(normal.y() * 100f), Math.round(normal.z() * 100f),
                 Math.round(u * 4096f), Math.round(v * 4096f), jointId);
-    }
-
-    /**
-     * Convert a YSM model package into an Epic Fight mesh JSON file.
-     *
-     * @param pkg         the parsed YSM model package
-     * @param outFile     the target mesh JSON file
-     * @param runtimeFile the target runtime script JSON file (bone table + animations)
-     * @param textureRL   the resource location of the model's default texture
-     * @return the number of quads converted, or -1 if the model has no geometry
-     */
-    public static int write(YsmModelPackage pkg, Path outFile, Path runtimeFile, String textureRL) throws IOException {
-        YSMGeoModel geoModel = pkg.geometry;
-        if (geoModel == null) {
-            return -1;
-        }
-        int quads = writeMeshJson(geoModel, pkg.widthScale, pkg.heightScale, outFile, textureRL);
-        if (quads < 0) {
-            return -1;
-        }
-        writeRuntimeJson(geoModel, pkg.scriptAnims, runtimeFile, true);
-        return quads;
     }
 
     /**
