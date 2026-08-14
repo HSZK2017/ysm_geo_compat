@@ -33,6 +33,15 @@ public final class YSMRuntimeBridge {
     }
 
     /**
+     * The entity currently being rendered on this thread, or null. Used by the
+     * GPU skinning path to verify the poseStack's world translation against the
+     * entity's actual camera-relative render position.
+     */
+    public static LivingEntity getCurrentEntity() {
+        return CURRENT_ENTITY.get();
+    }
+
+    /**
      * Evaluate the YSM scripts for the entity currently being rendered and apply
      * the results (per-part hidden flags and transforms) to the mesh. No-op when
      * there is no current entity or no runtime data for the mesh's model.

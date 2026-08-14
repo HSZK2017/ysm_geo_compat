@@ -50,6 +50,9 @@ public final class YSMMeshLibrary {
     /** textureRL string -> true once registered in the texture manager */
     private static final Map<String, Boolean> UPLOADED_TEXTURES = new ConcurrentHashMap<>();
 
+    /** textureRL string -> true when the texture has translucent pixels (alpha < 253). */
+    private static final Map<String, Boolean> TEXTURE_TRANSLUCENT = new ConcurrentHashMap<>();
+
     /**
      * Background pool for runtime-script preloads (compiling a runtime model
      * takes ~100ms for large models; doing it off the render thread keeps the
@@ -190,12 +193,56 @@ public final class YSMMeshLibrary {
                 UPLOADED_TEXTURES.put(rl.toString(), Boolean.TRUE);
                 return;
             }
+            // One-time full translucency scan while the image is still in memory:
+            // the CPU skinning path needs to know whether a translucent second
+            // (blended) draw pass is required (see isTranslucentTexture).
+            TEXTURE_TRANSLUCENT.put(rl.toString(), hasTranslucentPixels(image));
             Minecraft.getInstance().getTextureManager().register(rl, new DynamicTexture(image));
             UPLOADED_TEXTURES.put(rl.toString(), Boolean.TRUE);
         } catch (Throwable t) {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to upload texture {}", rl, t);
             UPLOADED_TEXTURES.put(rl.toString(), Boolean.TRUE);
         }
+    }
+
+    /**
+     * Whether the texture was fully uploaded to the texture manager (its GL
+     * texture id is valid). The CPU skinning path binds the model texture
+     * directly, so it must not draw before the upload completed.
+     */
+    public static boolean isTextureUploaded(ResourceLocation rl) {
+        return rl != null && UPLOADED_TEXTURES.containsKey(rl.toString());
+    }
+
+    /**
+     * Whether the model texture has translucent pixels (any alpha below 253),
+     * driving the CPU path's second (blended) draw pass. Unknown textures are
+     * treated as opaque.
+     */
+    public static boolean isTranslucentTexture(ResourceLocation rl) {
+        if (rl == null) {
+            return false;
+        }
+        return Boolean.TRUE.equals(TEXTURE_TRANSLUCENT.get(rl.toString()));
+    }
+
+    /**
+     * One-time full scan of the decoded texture for translucent pixels
+     * (alpha &lt; 253). Every pixel is checked, because a strided sampling
+     * misses small translucent regions (hair strands, gradients) and the CPU
+     * path's first pass then discards them (alphaMode == 1).
+     */
+    private static boolean hasTranslucentPixels(NativeImage image) {
+        int width = image.getWidth();
+        int height = image.getHeight();
+        for (int y = 0; y < height; y++) {
+            for (int x = 0; x < width; x++) {
+                if (((image.getPixelRGBA(x, y) >>> 24) & 0xFF) < 253) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

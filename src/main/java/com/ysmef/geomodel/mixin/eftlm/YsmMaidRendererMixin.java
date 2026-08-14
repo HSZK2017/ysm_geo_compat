@@ -1,6 +1,7 @@
 package com.ysmef.geomodel.mixin.eftlm;
 
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
+import com.ysmef.geomodel.YSMGeoCompat;
 import com.ysmef.geomodel.eftlm.YsmMaidMeshSupport;
 import com.ysmef.geomodel.model.TlmModelLibrary;
 import net.EFTLM.EF.Capability.MaidPatch;
@@ -40,6 +41,14 @@ import yesman.epicfight.client.mesh.HumanoidMesh;
 @Mixin(value = PatchedLivingMaidRenderer.class, remap = false)
 public abstract class YsmMaidRendererMixin {
 
+    /**
+     * Per-model mesh-source confirmation logs, deduped by (source, model id):
+     * every maid model id that ever renders is logged once with the mesh source
+     * actually used (EFTLM builtin mesh / EFTLM covered default / converted
+     * TLM mesh / YSM yield / missing), independent of battle or idle mode.
+     */
+    private static final java.util.Set<String> LOGGED_SOURCES = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     @Inject(method = "getMeshProvider(Lnet/EFTLM/EF/Capability/MaidPatch;)Lyesman/epicfight/api/asset/AssetAccessor;",
             at = @At("HEAD"), cancellable = true, remap = false)
     private void ysmef$useTlmMesh(MaidPatch<EntityMaid> maidPatch,
@@ -48,16 +57,21 @@ public abstract class YsmMaidRendererMixin {
         if (maid == null) {
             return;
         }
+        String modelId = maidPatch.getModelID();
+        String displayName = maid.getName().getString();
         if (maid.isYsmModel()) {
             // YSM-model maids belong to YSM_EpicFight_Compat (when installed);
             // leave the return value untouched so its injector wins.
+            String ysmId = maid.getYsmModelId();
+            logMeshSourceOnce(ysmId != null && !ysmId.isEmpty() ? ysmId : modelId,
+                    "YSM-yield (YSM_EpicFight_Compat)", displayName);
             return;
         }
-        String modelId = maidPatch.getModelID();
         // EFTLM ships its own tuned mesh for this model id (keyed by the
         // namespace-stripped id, see MaidPatch#getModelID): prefer it.
         Meshes.MeshAccessor<MaidMesh> eftlmMesh = EFTLM_Meshes.getMesh(modelId);
         if (eftlmMesh != null) {
+            logMeshSourceOnce(modelId, "EFTLM builtin mesh", displayName);
             cir.setReturnValue(eftlmMesh);
             return;
         }
@@ -65,14 +79,27 @@ public abstract class YsmMaidRendererMixin {
         // EFTLM's built-in meshes too (its getMeshProvider falls back to the
         // default WineFox mesh): do not substitute the converted mesh.
         if (TlmModelLibrary.isEftlmCovered(modelId)) {
+            logMeshSourceOnce(modelId, "EFTLM covered (default mesh)", displayName);
             return;
         }
         // EFTLM has no mesh for this model: substitute the converted mesh.
         AssetAccessor<HumanoidMesh> mesh = YsmMaidMeshSupport.selectMaidMesh(maid);
         if (mesh != null) {
+            logMeshSourceOnce(modelId, "converted TLM mesh", displayName);
             @SuppressWarnings("unchecked")
             AssetAccessor<MaidMesh> result = (AssetAccessor<MaidMesh>) (AssetAccessor<?>) mesh;
             cir.setReturnValue(result);
+        } else {
+            logMeshSourceOnce(modelId, "missing (EFTLM default mesh)", displayName);
+        }
+    }
+
+    private static void logMeshSourceOnce(String modelId, String source, String displayName) {
+        String id = modelId == null ? "<null>" : modelId;
+        if (LOGGED_SOURCES.add(source + "|" + id)) {
+            YSMGeoCompat.LOGGER.info(
+                    "YSM-GEO Compat: maid '{}' (model '{}') mesh source: {} (applies to both battle and idle mode)",
+                    displayName, id, source);
         }
     }
 }

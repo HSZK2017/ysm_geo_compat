@@ -83,6 +83,14 @@ public class YSMCompatClientEvents {
         event.registerReloadListener((ResourceManagerReloadListener) resourceManager -> {
             YSMRuntimeModel.invalidateAll();
             YSMRuntimeModel.clearAnimators();
+            // Release the CPU/GPU skinning paths' per-mesh GL buffers (VBO/VAO/
+            // bone SSBO) of the previous mesh generation: the meshes themselves
+            // are regenerated below and the old instances are dropped, so their
+            // render-path resources would otherwise leak one dynamic VBO + CPU
+            // buffer (CPU path) / one static VBO + bone SSBO (GPU path) per
+            // model per reload.
+            com.ysmef.geomodel.cpu.YsmCpuRenderPath.disposeAll();
+            com.ysmef.geomodel.gpu.YsmGpuRenderPath.disposeAll();
             try {
                 TlmModelLibrary.resetLazyGeneration();
                 TlmModelLibrary.generateAll(resourceManager);

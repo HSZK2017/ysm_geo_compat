@@ -48,7 +48,6 @@ public final class YsmMaidMeshSupport {
         TlmModelLibrary.ensureGenerated();
         TlmModelLibrary.TlmMeshEntry entry = TlmModelLibrary.find(tlmModelId);
         if (entry == null) {
-            logMeshMissingOnce(tlmModelId, maid);
             return null;
         }
         return YSMMeshSelector.selectResolvedMesh(maid, entry.accessor(), tlmModelId,
@@ -63,14 +62,6 @@ public final class YsmMaidMeshSupport {
         if (LOGGED.add("hook-active")) {
             YSMGeoCompat.LOGGER.info(
                     "YSM-GEO Compat: maid mesh hook active (first maid model='{}')", modelId);
-        }
-    }
-
-    private static void logMeshMissingOnce(String modelId, EntityMaid maid) {
-        if (LOGGED.add("missing|" + modelId)) {
-            YSMGeoCompat.LOGGER.warn(
-                    "YSM-GEO Compat: no converted mesh for maid model '{}' (maid '{}'), falling back to EFTLM default mesh",
-                    modelId, maid.getName().getString());
         }
     }
 }
