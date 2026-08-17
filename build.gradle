@@ -102,4 +102,8 @@ jar.finalizedBy('reobfJar')
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
+    // YsmAnimationTransitionGuardMixin targets YSM classes by name; this mod has
+    // no YSM compile dependency. A missing string target must be a warning, not
+    // an annotation-processor error (the mixin is runtime-optional).
+    options.compilerArgs += '-AMSG_MIXIN_SOFT_TARGET_NOT_FOUND=warning'
 }

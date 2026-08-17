@@ -18,6 +18,7 @@ import yesman.epicfight.client.renderer.shader.compute.ComputeShaderSetup;
 import javax.annotation.Nullable;
 import java.lang.reflect.Field;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * A HumanoidMesh loaded from a generated Epic Fight animmodels JSON (see
@@ -172,11 +173,16 @@ public class YSMMesh extends HumanoidMesh {
      * Epic Fight's CPU skinning path (ClientConfig.activateComputeShader = false,
      * the default) renders converted meshes with missing faces, while the compute
      * shader path is correct. Epic Fight creates its ComputeShaderSetup in the
-     * SkinnedMesh constructor whenever the GPU supports compute shaders, so this
-     * forces the compute path for our meshes regardless of the config. Without a
+     * SkinnedMesh constructor whenever the GPU supports compute shaders, so the
+     * compute path is available regardless of the config.
+     *
+     * Routing preference: when the GPU skinning path could not take the draw,
+     * small meshes and GUI entity previews use this mod's CPU skinning path
+     * (CPU skin -> dynamic VBO -> cpu_skin shader); meshes above
+     * {@link #CPU_PATH_MAX_VERTICES} use the compute shader in world renders so
+     * high-poly many-maid scenes do not pay per-vertex CPU skinning. Without a
      * compute setup (unsupported GPU) the drawPosed fallback is reached, where
-     * SkinnedMeshCpuRenderMixin substitutes this mod's CPU skinning render path
-     * (CPU skin -> dynamic VBO -> cpu_skin shader) - see YsmCpuRenderPath. The
+     * SkinnedMeshCpuRenderMixin substitutes the CPU renderer. The
      * ysm_geo_compat.force_cpu_render system property skips the compute shader
      * even when available, so the CPU path can be verified on capable hardware.
      */
@@ -186,6 +192,24 @@ public class YSMMesh extends HumanoidMesh {
                                        @Nullable Armature armature, OpenMatrix4f[] poses) {
         ComputeShaderSetup setup = poses != null && armature != null ? computeShaderSetup() : null;
         if (setup != null && !YsmCpuRenderPath.isForced()) {
+            int positionCount = this.positions().length / 3;
+            // The CPU path skins every visible vertex on the render thread every
+            // frame. Large GEO models would spend milliseconds per model there,
+            // so once a mesh passes this size the Epic Fight compute path is
+            // preferred: its vertex skinning runs on the GPU and its render-thread
+            // cost stays bounded in many-maid scenes. GUI entity previews keep
+            // the CPU preference (Epic Fight disables its compute pass there).
+            boolean guiEntityPreview = YsmGpuRenderPath.isGuiEntityProjection()
+                    || YsmGpuRenderPath.isYsmPreviewMode();
+            if (!guiEntityPreview && positionCount > CPU_PATH_MAX_VERTICES) {
+                logComputePreferredOnce(positionCount);
+            }
+            if ((guiEntityPreview || positionCount <= CPU_PATH_MAX_VERTICES)
+                    && !(bufferSources instanceof net.minecraft.client.renderer.OutlineBufferSource)
+                    && YsmCpuRenderPath.tryRender(this, poseStack, drawingFunction,
+                            packedLight, r, g, b, a, overlay, armature, poses)) {
+                return;
+            }
             setup.drawWithShader(this, poseStack, bufferSources,
                     EpicFightRenderTypes.getTriangulated(renderType),
                     packedLight, r, g, b, a, overlay, armature, poses);
@@ -222,6 +246,27 @@ public class YSMMesh extends HumanoidMesh {
     private static final Field COMPUTE_SETUP_FIELD = findComputeSetupField();
 
     private static volatile boolean computeFallbackWarned = false;
+
+    /**
+     * Meshes at or below this many unique positions may use the CPU skinning
+     * path; larger meshes prefer Epic Fight's compute path so the render thread
+     * is not skinning hundreds of thousands of vertices per frame in
+     * many-maid scenes.
+     */
+    private static final int CPU_PATH_MAX_VERTICES = 8192;
+
+    private static final Set<String> COMPUTE_PREFERRED_LOGGED = ConcurrentHashMap.newKeySet();
+
+    /** Once per model: the compute path took over because the mesh is too large for CPU skinning. */
+    private void logComputePreferredOnce(int positionCount) {
+        String key = this.runtimeModelId == null ? "n/a" : this.runtimeModelId;
+        if (COMPUTE_PREFERRED_LOGGED.add(key)) {
+            YSMGeoCompat.LOGGER.info(
+                    "YSM-GEO Compat: model '{}' has {} unique vertices (>{}); using Epic Fight's compute path "
+                            + "instead of CPU skinning to keep the render thread bounded in many-maid scenes",
+                    key, positionCount, CPU_PATH_MAX_VERTICES);
+        }
+    }
 
     private static Field findComputeSetupField() {
         try {

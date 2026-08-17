@@ -103,15 +103,26 @@ public final class YsmCpuRenderPath {
     /** Once per mesh + reason: why the CPU path was skipped (diagnostics, removable). */
     private static final Map<YSMMesh, String> CPU_SKIP_DIAG = new ConcurrentHashMap<>();
 
+    private static volatile boolean CPU_SKIP_FIRST_LOGGED = false;
+
     private static void cpuSkipDiag(YSMMesh mesh, String reason) {
         String prev = CPU_SKIP_DIAG.put(mesh, reason);
-        if (!reason.equals(prev)) {
+        boolean changed = !reason.equals(prev);
+        if (!CPU_SKIP_FIRST_LOGGED) {
+            CPU_SKIP_FIRST_LOGGED = true;
+            YSMGeoCompat.LOGGER.info(
+                    "YSM-GEO Compat: CPU skinning path skipped its first draw: model={} reason={} "
+                            + "(falling back; set ysm_geo_compat.diag=true for the full skip trace)",
+                    mesh.getRuntimeModelId(), reason);
+            return;
+        }
+        if (changed && Boolean.getBoolean("ysm_geo_compat.diag")) {
             YSMGeoCompat.LOGGER.info(
                     "YSM-GEO Compat: [diag] CPU path skip: model={} reason={}", mesh.getRuntimeModelId(), reason);
         }
     }
 
-    private static boolean cpuActiveLogged = false;
+    private static final Set<YSMMesh> CPU_ACTIVE_LOGGED = ConcurrentHashMap.newKeySet();
     private static boolean failureLogged = false;
 
     private YsmCpuRenderPath() {}
@@ -127,15 +138,13 @@ public final class YsmCpuRenderPath {
         return System.getProperty("ysm_geo_compat.force_cpu_render") != null;
     }
 
-    /** Once per session: confirm the CPU skinning path is drawing. */
+    /** Once per mesh: confirm the CPU skinning path is drawing this model. */
     private static void logCpuActiveOnce(YSMMesh mesh, int writtenCount) {
-        if (cpuActiveLogged) {
-            return;
+        if (CPU_ACTIVE_LOGGED.add(mesh)) {
+            YSMGeoCompat.LOGGER.info(
+                    "YSM-GEO Compat: CPU skinning path active (CPU skin -> dynamic VBO -> cpu_skin shader): model='{}', {} parts, {} vertices drawn",
+                    mesh.getRuntimeModelId(), mesh.getPartCount(), writtenCount);
         }
-        cpuActiveLogged = true;
-        YSMGeoCompat.LOGGER.info(
-                "YSM-GEO Compat: CPU skinning path active (CPU skin -> dynamic VBO -> cpu_skin shader): model='{}', {} parts, {} vertices drawn",
-                mesh.getRuntimeModelId(), mesh.getPartCount(), writtenCount);
     }
 
     private static void logUnavailableOnce() {
