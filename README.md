@@ -114,7 +114,7 @@ config/ysm_geo_compat/
 
 ## 安装
 
-1. 将 `YSM_GEO_Compat-1.20.1-1.0.2.jar` 放入 `mods/`。
+1. 将 `YSM_GEO_Compat-1.20.1-1.0.3.jar` 放入 `mods/`。
 2. 必装 Epic Fight；女仆支持需 Touhou Little Maid + EpicFight_TouhouLittleMaid。
 3. 需要玩家 YSM 模型或 YSM 女仆时，同时安装 YSM_EpicFight_Compat（本模组与其共存时仅处理 TLM 模型）。
 

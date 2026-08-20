@@ -173,9 +173,19 @@ public final class YSMJointMapper {
      * removed, and trailing digits stripped so alternate-form subtrees of a model
      * (e.g. "LeftArm2" of a fox variant) map to the same EF joint as the primary
      * form ("LeftArm").
+     *
+     * YSM models may additionally name the default form's geometry
+     * "&lt;bone&gt;_Default" (e.g. winefox_momo's "RightArm_Default" carries the actual
+     * upper-arm cubes while "RightArm" is an empty locator shell). The suffix is
+     * stripped so the default-form geometry maps to its EF joint instead of
+     * being treated as an unmapped decoration - without this the whole limb
+     * loses its geometry and the bind-armature pivot falls onto whatever stray
+     * replacement-form bone resolves to the joint (visible as a badly detached
+     * arm).
      */
     private static String normalize(String boneName) {
-        String normalized = boneName.toLowerCase().replace("_", "").replace(" ", "");
+        String suffixStripped = boneName.toLowerCase().replace("_default", "");
+        String normalized = suffixStripped.replace("_", "").replace(" ", "");
         int end = normalized.length();
         while (end > 0 && Character.isDigit(normalized.charAt(end - 1))) {
             end--;
