@@ -83,6 +83,11 @@ public class YSMCompatClientEvents {
         event.registerReloadListener((ResourceManagerReloadListener) resourceManager -> {
             YSMRuntimeModel.invalidateAll();
             YSMRuntimeModel.clearAnimators();
+            // Drop every re-bound bind armature and captured pose of the model-part
+            // pose correction (YsmBindArmature): the meshes are regenerated below
+            // and the old instances are dropped, so the cached per-model armatures
+            // would otherwise keep the stale geometry-derived pivots alive.
+            com.ysmef.geomodel.model.runtime.YsmBindArmature.invalidateAll();
             // Release the CPU/GPU skinning paths' per-mesh GL buffers (VBO/VAO/
             // bone SSBO) of the previous mesh generation: the meshes themselves
             // are regenerated below and the old instances are dropped, so their

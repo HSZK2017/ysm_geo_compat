@@ -413,15 +413,20 @@ public final class TlmModelLibrary {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to write TLM mesh for {}: {}", modelId, e.toString());
             return false;
         }
-        if (!scriptAnims.isEmpty()) {
-            try {
-                EFMeshJsonWriter.writeRuntimeJson(geoModel, scriptAnims, YSMMeshLibrary.getRuntimeFile("tlm/" + meshFile), showBackpack);
-                // compile the freshly written runtime JSON off-thread so the first
-                // maid draw finds the compiled scripts instead of compiling inline
-                YSMMeshLibrary.preloadRuntimeAsync(modelId);
-            } catch (Exception e) {
-                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to write TLM runtime for {}: {}", modelId, e.toString());
-            }
+        // Always write the runtime JSON - even when the model ships no
+        // animations: the bone table (hierarchy + EF joint binding) is what
+        // YsmBindArmature's pose correction reads to compute the per-joint
+        // pivots, and models without animation entries (the built-in Touhou
+        // Q-style maids have an empty "animation" list) would otherwise get no
+        // bind armature at all and keep Epic Fight's Steve-proportion pivots
+        // (head/elbow/knee positions completely wrong for their tiny build).
+        try {
+            EFMeshJsonWriter.writeRuntimeJson(geoModel, scriptAnims, YSMMeshLibrary.getRuntimeFile("tlm/" + meshFile), showBackpack);
+            // compile the freshly written runtime JSON off-thread so the first
+            // maid draw finds the compiled scripts instead of compiling inline
+            YSMMeshLibrary.preloadRuntimeAsync(modelId);
+        } catch (Exception e) {
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to write TLM runtime for {}: {}", modelId, e.toString());
         }
 
         Meshes.MeshAccessor<YSMMesh> accessor = Meshes.MeshAccessor.create(

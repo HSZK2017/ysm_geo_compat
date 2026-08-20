@@ -140,6 +140,7 @@ Processing entries
 Conflicting propagated mapping for yesman/epicfight/api/client/model/Meshes/reload(Lnet/minecraft/server/packs/resources/PreparableReloadListener$PreparationBarrier;Lnet/minecraft/server/packs/resources/ResourceManager;Lnet/minecraft/util/profiling/ProfilerFiller;Lnet/minecraft/util/profiling/ProfilerFiller;Ljava/util/concurrent/Executor;Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture; from net/minecraft/server/packs/resources/PreparableReloadListener/reload(Lnet/minecraft/server/packs/resources/PreparableReloadListener$PreparationBarrier;Lnet/minecraft/server/packs/resources/ResourceManager;Lnet/minecraft/util/profiling/ProfilerFiller;Lnet/minecraft/util/profiling/ProfilerFiller;Ljava/util/concurrent/Executor;Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture;: reload -> m_5540_
 Conflicting propagated mapping for yesman/epicfight/client/renderer/EpicFightRenderTypes/lambda$static$6(Lnet/minecraft/resources/ResourceLocation;)Lnet/minecraft/client/renderer/RenderType; from net/minecraft/client/renderer/RenderType/lambda$static$6(Lnet/minecraft/resources/ResourceLocation;)Lnet/minecraft/client/renderer/RenderType;: lambda$static$6 -> m_285695_
 Conflicting propagated mapping for yesman/epicfight/client/renderer/EpicFightRenderTypes/debugQuads()Lnet/minecraft/client/renderer/RenderType; from net/minecraft/client/renderer/RenderType/debugQuads()Lnet/minecraft/client/renderer/RenderType;: debugQuads -> m_269166_
+Conflicting propagated mapping for net/minecraft/world/entity/LivingEntity/lambda$addAdditionalSaveData$3(Lnet/minecraft/nbt/CompoundTag;Lnet/minecraft/nbt/Tag;)V from net/minecraft/world/entity/player/Player/lambda$addAdditionalSaveData$3(Lnet/minecraft/nbt/CompoundTag;Lnet/minecraft/nbt/Tag;)V: lambda$addAdditionalSaveData$3 -> m_219754_
 Conflicting propagated mapping for yesman/epicfight/client/renderer/EpicFightRenderTypes/lambda$static$5(Lnet/minecraft/resources/ResourceLocation;)Lnet/minecraft/client/renderer/RenderType; from net/minecraft/client/renderer/RenderType/lambda$static$5(Lnet/minecraft/resources/ResourceLocation;)Lnet/minecraft/client/renderer/RenderType;: lambda$static$5 -> m_285687_
 Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/entity/passive/EntityMaid/getHurtSound(Lnet/minecraft/world/damagesource/DamageSource;)Lnet/minecraft/sounds/SoundEvent; from net/minecraft/world/entity/LivingEntity/getHurtSound(Lnet/minecraft/world/damagesource/DamageSource;)Lnet/minecraft/sounds/SoundEvent;: getHurtSound -> m_7975_
 Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/entity/passive/EntityMaid/getBreedOffspring(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/AgeableMob;)Lnet/minecraft/world/entity/AgeableMob; from net/minecraft/world/entity/AgeableMob/getBreedOffspring(Lnet/minecraft/server/level/ServerLevel;Lnet/minecraft/world/entity/AgeableMob;)Lnet/minecraft/world/entity/AgeableMob;: getBreedOffspring -> m_142606_
@@ -220,7 +221,6 @@ Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/enti
 Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/entity/passive/EntityMaid/shootCrossbowProjectile(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/entity/projectile/Projectile;F)V from net/minecraft/world/entity/monster/CrossbowAttackMob/shootCrossbowProjectile(Lnet/minecraft/world/entity/LivingEntity;Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/entity/projectile/Projectile;F)V: shootCrossbowProjectile -> m_5811_
 Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/entity/passive/EntityMaid/setChargingCrossbow(Z)V from net/minecraft/world/entity/monster/CrossbowAttackMob/setChargingCrossbow(Z)V: setChargingCrossbow -> m_6136_
 Conflicting propagated mapping for com/github/tartaricacid/touhoulittlemaid/api/entity/IMaid/onClimbable()Z from com/github/tartaricacid/touhoulittlemaid/entity/passive/EntityMaid/onClimbable()Z: onClimbable -> m_6147_
-Conflicting propagated mapping for net/minecraft/world/entity/LivingEntity/lambda$addAdditionalSaveData$3(Lnet/minecraft/nbt/CompoundTag;Lnet/minecraft/nbt/Tag;)V from net/minecraft/world/entity/player/Player/lambda$addAdditionalSaveData$3(Lnet/minecraft/nbt/CompoundTag;Lnet/minecraft/nbt/Tag;)V: lambda$addAdditionalSaveData$3 -> m_219754_
 Conflicting propagated mapping for net/EFTLM/EF/Model/EFTLM_Meshes/onResourceManagerReload(Lnet/minecraft/server/packs/resources/ResourceManager;)V from net/minecraft/server/packs/resources/ResourceManagerReloadListener/onResourceManagerReload(Lnet/minecraft/server/packs/resources/ResourceManager;)V: onResourceManagerReload -> m_6213_
 Adding extras
 Sorting
@@ -256,6 +256,7 @@ Writing Output: E:\program\JAVA\move\ysm_geo_model\build\reobfJar\output.jar
   com/ysmef/geomodel/mixin/RenderSystemAccessorMixin.class
   com/ysmef/geomodel/mixin/SkinnedMeshCpuRenderMixin.class
   com/ysmef/geomodel/mixin/YsmAnimationTransitionGuardMixin.class
+  com/ysmef/geomodel/mixin/YsmArmaturePoseMixin.class
   com/ysmef/geomodel/mixin/YsmGeoMixinPlugin.class
   com/ysmef/geomodel/mixin/eftlm/
   com/ysmef/geomodel/mixin/eftlm/YsmMaidRendererMixin.class
@@ -280,6 +281,8 @@ Writing Output: E:\program\JAVA\move\ysm_geo_model\build\reobfJar\output.jar
   com/ysmef/geomodel/model/runtime/YSMRuntimeModel$CompiledChannels.class
   com/ysmef/geomodel/model/runtime/YSMRuntimeModel$CompiledTimeline.class
   com/ysmef/geomodel/model/runtime/YSMRuntimeModel.class
+  com/ysmef/geomodel/model/runtime/YsmBindArmature$Entry.class
+  com/ysmef/geomodel/model/runtime/YsmBindArmature.class
   com/ysmef/geomodel/renderer/
   com/ysmef/geomodel/renderer/YSMBattleMode.class
   com/ysmef/geomodel/renderer/YSMMeshSelector.class

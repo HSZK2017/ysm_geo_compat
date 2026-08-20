@@ -510,6 +510,21 @@ public final class YsmGpuRenderPath {
             return false;
         }
 
+        // Save the GL state this path overrides so it can be restored after the
+        // draw. The path draws with cull/blend/depth overrides tuned for the
+        // world entity render; without a restore, the residue (cull disabled,
+        // blend disabled, ...) leaks into whatever renders next. In Epic Fight
+        // battle mode with a held item the item layer re-establishes the state,
+        // which is why the corruption was only visible on EMPTY-handed maids:
+        // nothing after the mesh draw resets the state, and the GUI/other
+        // entities then render with stale state (visible as a red rectangle in
+        // GUI passes). Saving/restoring around the draw keeps the path
+        // side-effect free on every render chain.
+        boolean cullEnabled = GL11.glIsEnabled(GL11.GL_CULL_FACE);
+        boolean blendEnabled = GL11.glIsEnabled(GL11.GL_BLEND);
+        boolean depthTestEnabled = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
+        boolean depthMaskEnabled = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+
         RenderSystem.disableCull();
         RenderSystem.enableDepthTest();
         RenderSystem.depthMask(true);
@@ -606,6 +621,24 @@ public final class YsmGpuRenderPath {
         GlStateManager._glBindVertexArray(0);
 
         mc.gameRenderer.lightTexture().turnOffLightLayer();
+
+        // Restore the state saved before the draw (see the save block above).
+        if (cullEnabled) {
+            RenderSystem.enableCull();
+        } else {
+            RenderSystem.disableCull();
+        }
+        if (blendEnabled) {
+            RenderSystem.enableBlend();
+        } else {
+            RenderSystem.disableBlend();
+        }
+        if (depthTestEnabled) {
+            RenderSystem.enableDepthTest();
+        } else {
+            RenderSystem.disableDepthTest();
+        }
+        RenderSystem.depthMask(depthMaskEnabled);
 
         logGpuActiveOnce(mesh, gpu);
         return true;

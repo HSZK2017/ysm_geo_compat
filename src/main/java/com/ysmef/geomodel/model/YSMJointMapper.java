@@ -115,15 +115,45 @@ public final class YSMJointMapper {
     private YSMJointMapper() {}
 
     /**
+     * The normalized mapping-table key of a bone name, or null when the name
+     * does not map to any EF joint.
+     *
+     * Blockbench-style authors often append variant markers to primary bones:
+     * zhiban_new_year's legs are named "LeftLegY2" / "LeftLowerLegY" /
+     * "LeftFootH2" (empty "LeftLeg" shells carry the locator hierarchy). The
+     * plain normalization (lower case, digits stripped) leaves the trailing
+     * letter in place ("leftlegy2" -> "leftlegy"), which is NOT in the table,
+     * so those geometry-carrying bones were treated as unmapped decorations and
+     * the whole limb lost its pivot. When the normalized name misses, one
+     * trailing letter is additionally stripped and the lookup retried
+     * ("leftlegy2" -> "leftlegy" -> "leftleg"). Only ONE letter is ever
+     * stripped: real multi-letter suffixes ("LeftHandLocator", "chestnut",
+     * "headdressLeftTop"...) must keep missing and fall back to the ancestor
+     * walk instead of being mis-mapped onto an unrelated joint.
+     */
+    private static String mappingKey(String boneName) {
+        String normalized = normalize(boneName);
+        if (STANDARD_MAPPING.containsKey(normalized)) {
+            return normalized;
+        }
+        if (!normalized.isEmpty() && Character.isLetter(normalized.charAt(normalized.length() - 1))) {
+            String withoutTailLetter = normalized.substring(0, normalized.length() - 1);
+            if (STANDARD_MAPPING.containsKey(withoutTailLetter)) {
+                return withoutTailLetter;
+            }
+        }
+        return null;
+    }
+
+    /**
      * Resolve the EF joint id for a YSM bone, walking up the bone hierarchy when
      * the bone name itself is not a standard body part.
      */
     public static int resolveJointId(YSMGeoModel.Bone bone) {
         for (YSMGeoModel.Bone current = bone; current != null; current = current.parent) {
-            String normalized = normalize(current.name);
-            String efJointName = STANDARD_MAPPING.get(normalized);
-            if (efJointName != null) {
-                return JOINT_IDS.get(efJointName);
+            String key = mappingKey(current.name);
+            if (key != null) {
+                return JOINT_IDS.get(STANDARD_MAPPING.get(key));
             }
         }
         return JOINT_IDS.get("Root");
@@ -135,7 +165,7 @@ public final class YSMJointMapper {
      * other bones follow YSM's evaluated bone transforms on top.
      */
     public static boolean isDirectlyMapped(YSMGeoModel.Bone bone) {
-        return STANDARD_MAPPING.containsKey(normalize(bone.name));
+        return mappingKey(bone.name) != null;
     }
 
     /**

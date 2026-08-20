@@ -6,7 +6,8 @@
   "refmap": "ysm_geo_compat.refmap.json",
   "client": [
     "RenderSystemAccessorMixin",
-    "SkinnedMeshCpuRenderMixin"
+    "SkinnedMeshCpuRenderMixin",
+    "YsmArmaturePoseMixin"
   ],
   "injectors": {
     "defaultRequire": 1

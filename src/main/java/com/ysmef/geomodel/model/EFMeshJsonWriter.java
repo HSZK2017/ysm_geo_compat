@@ -205,6 +205,15 @@ public class EFMeshJsonWriter {
                                  List<Float> positions, List<Float> normals, List<Float> uvs,
                                  List<Integer> vcounts, List<Integer> vindices,
                                  Map<String, List<Integer>> partIndices, int[] quadCount) {
+        // TLM conditional parts (see isTlmConditionalBone): pieces the TLM
+        // animation system shows/hides at runtime (blink faces, task/status
+        // markers, armor plates, yukari's gap...). This mod does not play TLM's
+        // JS animations, so those parts would be permanently visible. Skipping
+        // them keeps the converted mesh at the model's default (unconditioned)
+        // appearance - the same default the TLM animations start from.
+        if (isTlmConditionalBone(bone.name)) {
+            return;
+        }
         Matrix4f boneTransform = new Matrix4f(parentTransform);
         boneTransform.translate(bone.pivotX, bone.pivotY, bone.pivotZ);
         boneTransform.rotateZ(bone.rotZ);
@@ -273,6 +282,63 @@ public class EFMeshJsonWriter {
     /** The Epic Fight part name carrying the geometry of the given YSM bone. */
     public static String partNameOf(YSMGeoModel.Bone bone) {
         return BONE_PART_PREFIX + bone.name;
+    }
+
+    /**
+     * Whether a bone is a Touhou Little Maid CONDITIONAL part - geometry the
+     * TLM animation system (JavaScript, not bedrock molang) shows or hides at
+     * runtime. This mod cannot play those JS animations, so such parts would
+     * render permanently; they are excluded from the converted mesh instead.
+     *
+     * The naming rules mirror the TLM animation scripts (MaidBaseAnimation,
+     * MaidTaskAnimation, MaidArmorAnimation, EntityBaseAnimation):
+     * - "*Show" bones: shown only while a condition holds (begShow, attackShow,
+     *   dayShow, newYearShow, passengerShow, randomSelectN...); hidden by
+     *   default - the exact opposite of "*Hidden" bones, which stay visible.
+     * - "blink"/"blink2": eyelids shown for a few ticks every blink cycle.
+     * - armor bones ("helmet", "chestPlate", "leggings", "boots" and their
+     *   left/middle/right/temperature/value variants): visible only while the
+     *   maid wears the matching armor piece.
+     * - "crack"/"gap": yukari's gap (the huge foreground slit plane) - an
+     *   effect piece, not part of the body.
+     */
+    private static boolean isTlmConditionalBone(String boneName) {
+        String n = normalizeBoneName(boneName);
+        if (n.endsWith("show")) {
+            return true;
+        }
+        // eyelids and hurt/angry faces: "blink", "blink2", "hurtBlink" (TLM's
+        // head/blink.js and head/hurt.js hide them outside their blink window /
+        // hurt state).
+        if (n.endsWith("blink")) {
+            return true;
+        }
+        if (n.startsWith("helmet") || n.startsWith("chestplate")
+                || n.startsWith("leggings") || n.startsWith("boots")) {
+            return true;
+        }
+        if (n.startsWith("randomselect")) {
+            return true;
+        }
+        if (n.equals("crack") || n.equals("gap")) {
+            return true;
+        }
+        // patchouli's spellbook pages (the floating "page"/"page4..6" bones
+        // under sinFloat/cosFloat): a spell-casting prop, not part of the body.
+        if (n.equals("page") || n.matches("page\\d+")) {
+            return true;
+        }
+        return false;
+    }
+
+    /** Lower case, spaces/underscores removed, trailing digits stripped (mirrors YSMJointMapper). */
+    private static String normalizeBoneName(String boneName) {
+        String normalized = boneName.toLowerCase().replace("_", "").replace(" ", "");
+        int end = normalized.length();
+        while (end > 0 && Character.isDigit(normalized.charAt(end - 1))) {
+            end--;
+        }
+        return normalized.substring(0, end);
     }
 
     private static JsonObject partArray(List<Integer> indices) {
