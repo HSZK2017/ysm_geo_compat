@@ -19,28 +19,12 @@ public final class YSMJointMapper {
     private static final Map<String, Integer> JOINT_IDS = createJointIds();
     private static final Map<String, String> STANDARD_MAPPING = createMapping();
 
+    /** Built from {@link JointTable} so the ids can never drift from the bind armature's. */
     private static Map<String, Integer> createJointIds() {
         Map<String, Integer> map = new HashMap<>();
-        map.put("Root", 0);
-        map.put("Thigh_R", 1);
-        map.put("Leg_R", 2);
-        map.put("Knee_R", 3);
-        map.put("Thigh_L", 4);
-        map.put("Leg_L", 5);
-        map.put("Knee_L", 6);
-        map.put("Torso", 7);
-        map.put("Chest", 8);
-        map.put("Head", 9);
-        map.put("Shoulder_R", 10);
-        map.put("Arm_R", 11);
-        map.put("Hand_R", 12);
-        map.put("Tool_R", 13);
-        map.put("Elbow_R", 14);
-        map.put("Shoulder_L", 15);
-        map.put("Arm_L", 16);
-        map.put("Hand_L", 17);
-        map.put("Tool_L", 18);
-        map.put("Elbow_L", 19);
+        for (int i = 0; i < JointTable.COUNT; i++) {
+            map.put(JointTable.NAMES[i], i);
+        }
         return map;
     }
 
@@ -184,12 +168,43 @@ public final class YSMJointMapper {
      * arm).
      */
     private static String normalize(String boneName) {
-        String suffixStripped = boneName.toLowerCase().replace("_default", "");
-        String normalized = suffixStripped.replace("_", "").replace(" ", "");
+        return normalizeBoneName(boneName);
+    }
+
+    /**
+     * The project's single bone-name normalization: lower case, underscores and
+     * spaces removed, trailing digits stripped (so alternate-form subtrees such as
+     * "LeftArm2" map like "LeftArm"), and the default-form suffix removed.
+     *
+     * YSM models may name the default form's geometry "&lt;bone&gt;_Default"
+     * (e.g. winefox_momo's "RightArm_Default" carries the actual upper-arm cubes
+     * while "RightArm" is an empty locator shell). Without the suffix strip that
+     * geometry is treated as an unmapped decoration: the whole limb loses its
+     * geometry and the bind-armature pivot lands on whatever stray
+     * replacement-form bone resolves to the joint (a visibly detached arm).
+     *
+     * Shared by the joint mapper, the mesh writer and the bind armature so the
+     * three can never drift apart.
+     */
+    public static String normalizeBoneName(String boneName) {
+        if (boneName == null) {
+            return "";
+        }
+        String normalized = boneName.toLowerCase().replace("_", "").replace(" ", "");
         int end = normalized.length();
         while (end > 0 && Character.isDigit(normalized.charAt(end - 1))) {
             end--;
         }
-        return normalized.substring(0, end);
+        normalized = normalized.substring(0, end);
+        if (normalized.endsWith("default")) {
+            normalized = normalized.substring(0, normalized.length() - "default".length());
+            // the suffix itself may be followed by a digit group ("LeftArmDefault2")
+            end = normalized.length();
+            while (end > 0 && Character.isDigit(normalized.charAt(end - 1))) {
+                end--;
+            }
+            normalized = normalized.substring(0, end);
+        }
+        return normalized;
     }
 }

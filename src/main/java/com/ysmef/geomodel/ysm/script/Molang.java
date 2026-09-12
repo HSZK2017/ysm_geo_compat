@@ -35,7 +35,16 @@ public final class Molang {
 
         double getQueryById(int id);
 
-        double callFunction(String name, double[] args);
+        /**
+         * Evaluate a numeric function call.
+         *
+         * @param args     reusable argument slot buffer; only the first {@code argCount}
+         *                 entries are valid for this call. The buffer may still hold
+         *                 values from an earlier call because the evaluator reuses it,
+         *                 so implementations must never read past {@code argCount}.
+         * @param argCount number of arguments actually passed by this call site
+         */
+        double callFunction(String name, double[] args, int argCount);
 
         /** ctrl.hold('mainhand', ':sword') style calls with string arguments. */
         double callStringFunction(String name, String[] args);
@@ -112,6 +121,23 @@ public final class Molang {
         return CACHE.computeIfAbsent(src, Molang::parse);
     }
 
+    /**
+     * Optional sink for compile failures. Molang deliberately stays free of any
+     * Minecraft/Forge/logging dependency (it is a plain expression evaluator and
+     * is unit-testable on its own), so the mod installs the reporter at startup
+     * and everything else keeps working with the no-op default.
+     */
+    public interface ErrorReporter {
+        void onCompileFailure(String source, RuntimeException error);
+    }
+
+    private static volatile ErrorReporter errorReporter = (source, error) -> { };
+
+    /** Install the compile-failure sink (called once at mod init). */
+    public static void setErrorReporter(ErrorReporter reporter) {
+        errorReporter = reporter != null ? reporter : (source, error) -> { };
+    }
+
     private static Expr parse(String src) {
         try {
             Parser parser = new Parser(src);
@@ -129,6 +155,10 @@ public final class Molang {
             }
             return expr;
         } catch (RuntimeException e) {
+            // The result is cached by computeIfAbsent, so this fires once per
+            // distinct source string. Silent zeros made a broken expression
+            // (a variant that simply stops appearing) impossible to diagnose.
+            errorReporter.onCompileFailure(src, e);
             return ZERO;
         }
     }
@@ -166,7 +196,7 @@ public final class Molang {
         }
 
         @Override
-        public double callFunction(String name, double[] args) {
+        public double callFunction(String name, double[] args, int argCount) {
             throw new IllegalStateException("constant folding touched a function call");
         }
 
@@ -265,12 +295,33 @@ public final class Molang {
     // ------------------------------------------------------------------
 
     private static final class Parser {
+        /**
+         * Maximum recursive-descent nesting for ternary / unary / parenthesized
+         * sub-expressions. Model packs are third-party data: an expression like
+         * "((((((..." would otherwise recurse until the stack dies, and a
+         * StackOverflowError is an Error (not caught by the RuntimeException
+         * handler above) so it would kill whatever thread is evaluating.
+         */
+        private static final int MAX_PARSE_DEPTH = 256;
+
         private final Lexer lexer;
         private Token current;
+        private int depth;
 
         Parser(String src) {
             this.lexer = new Lexer(src);
             this.current = lexer.next();
+        }
+
+        private void enter() {
+            if (++depth > MAX_PARSE_DEPTH) {
+                depth--;
+                throw new IllegalStateException("molang expression nesting too deep");
+            }
+        }
+
+        private void leave() {
+            depth--;
         }
 
         private Token advance() {
@@ -357,25 +408,44 @@ public final class Molang {
         }
 
         private Expr parseTernary() {
-            Expr cond = parseCoalesce();
-            if (isOp("?")) {
-                advance();
-                Expr then = parseTernary();
-                expectOp(":");
-                Expr otherwise = parseTernary();
-                return env -> cond.eval(env) != 0.0 ? then.eval(env) : otherwise.eval(env);
+            enter();
+            try {
+                Expr cond = parseCoalesce();
+                if (isOp("?")) {
+                    advance();
+                    Expr then = parseTernary();
+                    Expr otherwise;
+                    if (isOp(":")) {
+                        advance();
+                        otherwise = parseTernary();
+                    } else {
+                        // Bedrock shorthand: `a ? b` without a `:` evaluates to b
+                        // when a != 0 and to 0 otherwise. Model packs use it (e.g.
+                        // 'q.ground_speed<=2?4'); requiring the colon made every
+                        // such expression fail to parse and silently evaluate to 0.
+                        otherwise = env -> 0.0;
+                    }
+                    return env -> cond.eval(env) != 0.0 ? then.eval(env) : otherwise.eval(env);
+                }
+                return cond;
+            } finally {
+                leave();
             }
-            return cond;
         }
 
         private Expr parseCoalesce() {
-            Expr left = parseOr();
-            if (isOp("??")) {
-                advance();
-                Expr right = parseCoalesce();
-                return new CoalesceExpr(left, right);
+            enter();
+            try {
+                Expr left = parseOr();
+                if (isOp("??")) {
+                    advance();
+                    Expr right = parseCoalesce();
+                    return new CoalesceExpr(left, right);
+                }
+                return left;
+            } finally {
+                leave();
             }
-            return left;
         }
 
         private Expr parseOr() {
@@ -472,27 +542,44 @@ public final class Molang {
         }
 
         private Expr parseUnary() {
-            if (isOp("-")) {
-                advance();
-                Expr e = parseUnary();
-                return env -> -e.eval(env);
+            enter();
+            try {
+                if (isOp("-")) {
+                    advance();
+                    Expr e = parseUnary();
+                    return env -> -e.eval(env);
+                }
+                if (isOp("!")) {
+                    advance();
+                    Expr e = parseUnary();
+                    return env -> e.eval(env) == 0.0 ? 1.0 : 0.0;
+                }
+                if (isOp("+")) {
+                    advance();
+                    return parseUnary();
+                }
+                return parsePrimary();
+            } finally {
+                leave();
             }
-            if (isOp("!")) {
-                advance();
-                Expr e = parseUnary();
-                return env -> e.eval(env) == 0.0 ? 1.0 : 0.0;
-            }
-            if (isOp("+")) {
-                advance();
-                return parseUnary();
-            }
-            return parsePrimary();
         }
 
         private Expr parsePrimary() {
             if (current.type() == T_NUM) {
                 double n = advance().num();
                 return env -> n;
+            }
+            if (current.type() == T_STR) {
+                // bare string literal (e.g. "ctrl.x != 'lit'"): no double can carry
+                // a string, so it evaluates to a per-string marker in a range no
+                // real molang value can reach. Comparisons then behave like YSM's
+                // string semantics: number == string is false, number != string is
+                // true (an unset ctrl.* query equals '' in the real YSM env, which
+                // differs from any non-empty literal), and string == string
+                // compares by marker identity. See {@link #stringMarker(String)}.
+                String str = advance().text();
+                double marker = stringMarker(str);
+                return env -> marker;
             }
             if (isOp("(")) {
                 advance();
@@ -536,7 +623,7 @@ public final class Molang {
                         for (int i = 0; i < exprArgs.length; i++) {
                             values[i] = exprArgs[i].eval(env);
                         }
-                        return env.callFunction(path, values);
+                        return env.callFunction(path, values, exprArgs.length);
                     };
                 }
                 return new VarExpr(path);
@@ -555,6 +642,21 @@ public final class Molang {
 
     private static double sanitize(double v) {
         return Double.isNaN(v) || Double.isInfinite(v) ? 0.0 : v;
+    }
+
+    /**
+     * Marker value of a string literal used as a bare operand. The interned id
+     * (0..n-1) is mapped into the -1e18 range, far below any real molang value
+     * (health / positions / rotation / scale magnitudes), so:
+     * - number == string evaluates false, number != string evaluates true;
+     * - string == same string is true, string == different string is false.
+     *
+     * Ids are spaced 4096 apart because a double at 1e18 has an ULP of 128
+     * (2^(59-52)); a tighter spacing would collapse distinct strings into one
+     * marker.
+     */
+    private static double stringMarker(String value) {
+        return -1.0e18 - idOf(value) * 4096.0;
     }
 
     /** Per-thread scratch for function arguments (the eval threads are stable). */

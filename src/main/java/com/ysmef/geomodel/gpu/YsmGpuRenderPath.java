@@ -89,7 +89,7 @@ public final class YsmGpuRenderPath {
                     mesh.getRuntimeModelId(), reason);
             return;
         }
-        if (changed && Boolean.getBoolean("ysm_geo_compat.diag")) {
+        if (changed && com.ysmef.geomodel.config.YSMCompatConfig.DIAG) {
             YSMGeoCompat.LOGGER.info(
                     "YSM-GEO Compat: [diag] GPU path skip: model={} reason={}", mesh.getRuntimeModelId(), reason);
         }
@@ -252,14 +252,27 @@ public final class YsmGpuRenderPath {
      * (ModelPreviewRenderer#isPreview). Those passes use GUI GL state that the
      * GPU skinning path's world-tuned texture-unit/light setup corrupts, which
      * is visible as a collapsed red rectangle over the preview.
+     *
+     * This runs for every candidate mesh draw, and the flag changes with screens
+     * rather than per frame, so the reflective call is TTL-cached like the
+     * shader-pack check instead of paying a Method.invoke per mesh per frame.
      */
+    private static long ysmPreviewCheckedAtNanos = 0L;
+    private static boolean ysmPreviewModeCache = false;
+
     public static boolean isYsmPreviewMode() {
+        long now = System.nanoTime();
+        if (now - ysmPreviewCheckedAtNanos < 250_000_000L) {
+            return ysmPreviewModeCache;
+        }
+        ysmPreviewCheckedAtNanos = now;
         try {
-            return YSM_PREVIEW_MODE_METHOD != null
+            ysmPreviewModeCache = YSM_PREVIEW_MODE_METHOD != null
                     && Boolean.TRUE.equals(YSM_PREVIEW_MODE_METHOD.invoke(null));
         } catch (Throwable t) {
-            return false;
+            ysmPreviewModeCache = false;
         }
+        return ysmPreviewModeCache;
     }
 
     /** Oculus/Iris API (reflective: the compat mod has no hard dependency on Oculus). */
@@ -280,8 +293,11 @@ public final class YsmGpuRenderPath {
      * custom GLSL program would bypass the pack's shaders, so the draw falls
      * back to Epic Fight's compute path, which has Iris support built in.
      * Reflective + TTL-cached (the pack state changes rarely).
+     *
+     * Public and shared: the CPU direct-draw path asks this same question and
+     * previously kept a verbatim copy with an independent TTL.
      */
-    private static boolean shaderPackInUse() {
+    public static boolean shaderPackInUse() {
         long now = System.nanoTime();
         if (now - shaderPackCheckedAtNanos < 250_000_000L) {
             return shaderPackInUseCache;
@@ -302,6 +318,54 @@ public final class YsmGpuRenderPath {
     }
 
     private YsmGpuRenderPath() {}
+
+    /**
+     * No-op that forces this class to initialize, i.e. to register itself with
+     * the release/dispatch registries. Called once from
+     * {@link com.ysmef.geomodel.renderer.RenderPaths#init()}.
+     */
+    public static void warmUp() {
+    }
+
+    // Registered on first class load (render thread, when the path is first
+    // used): resource release goes through MeshReleaser and the draw dispatch
+    // through RenderBridgeRegistry, so the model package never imports this class
+    // and the model <-> gpu/cpu package cycle stays broken.
+    static {
+        com.ysmef.geomodel.model.YSMMeshLibrary.registerMeshReleaser(new com.ysmef.geomodel.model.MeshReleaser() {
+            @Override
+            public void disposeMesh(YSMMesh mesh) {
+                YsmGpuRenderPath.disposeMesh(mesh);
+            }
+
+            @Override
+            public void disposeAll() {
+                YsmGpuRenderPath.disposeAll();
+            }
+        });
+        com.ysmef.geomodel.model.RenderBridgeRegistry.registerGpu(
+                new com.ysmef.geomodel.model.RenderBridgeRegistry.GpuSkinRender() {
+                    @Override
+                    public boolean tryRender(YSMMesh mesh, PoseStack poseStack,
+                                             net.minecraft.client.renderer.MultiBufferSource bufferSources,
+                                             ResourceLocation texture, int packedLight,
+                                             float r, float g, float b, float a, int overlay,
+                                             @Nullable Armature armature, @Nullable OpenMatrix4f[] poses) {
+                        return YsmGpuRenderPath.tryRender(mesh, poseStack, bufferSources, texture,
+                                packedLight, r, g, b, a, overlay, armature, poses);
+                    }
+
+                    @Override
+                    public boolean isGuiEntityProjection() {
+                        return YsmGpuRenderPath.isGuiEntityProjection();
+                    }
+
+                    @Override
+                    public boolean isYsmPreviewMode() {
+                        return YsmGpuRenderPath.isYsmPreviewMode();
+                    }
+                });
+    }
 
     /**
      * Whether the current projection is the GUI's orthographic one (set by
@@ -520,10 +584,14 @@ public final class YsmGpuRenderPath {
         // entities then render with stale state (visible as a red rectangle in
         // GUI passes). Saving/restoring around the draw keeps the path
         // side-effect free on every render chain.
-        boolean cullEnabled = GL11.glIsEnabled(GL11.GL_CULL_FACE);
-        boolean blendEnabled = GL11.glIsEnabled(GL11.GL_BLEND);
-        boolean depthTestEnabled = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
-        boolean depthMaskEnabled = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+        //
+        // The restore lives in the finally block below, NOT on the straight-line
+        // path: any throw inside the ~110 lines of GL work (missing texture,
+        // driver error, allocation failure) would otherwise skip it, escape into
+        // the entity render, and leave the light layer turned on. Everything the
+        // body changes is therefore either captured here or tracked by a flag.
+        com.ysmef.geomodel.renderer.GlRenderState.Snapshot glState =
+                com.ysmef.geomodel.renderer.GlRenderState.capture();
 
         RenderSystem.disableCull();
         RenderSystem.enableDepthTest();
@@ -531,117 +599,145 @@ public final class YsmGpuRenderPath {
         RenderSystem.disableBlend();
 
         Minecraft mc = Minecraft.getInstance();
-        AbstractTexture modelTex = mc.getTextureManager().getTexture(texture);
-        int modelTexId = modelTex.getId();
+        boolean lightLayerOn = false;
+        try {
+            AbstractTexture modelTex = mc.getTextureManager().getTexture(texture);
+            if (modelTex == null) {
+                // The byte registry says "uploaded" but the texture manager has no
+                // entry for this location; binding it would draw an untextured
+                // mesh. Thrown inside the try so the finally undoes the state we
+                // already changed above.
+                throw new IllegalStateException("texture not registered: " + texture);
+            }
+            int modelTexId = modelTex.getId();
 
-        GlStateManager._activeTexture(GL13.GL_TEXTURE0 + 2);
-        mc.gameRenderer.lightTexture().turnOnLightLayer();
+            GlStateManager._activeTexture(GL13.GL_TEXTURE0 + 2);
+            mc.gameRenderer.lightTexture().turnOnLightLayer();
+            lightLayerOn = true;
 
-        GlStateManager._activeTexture(GL13.GL_TEXTURE0 + 1);
-        mc.gameRenderer.overlayTexture().setupOverlayColor();
-        // the overlay texture has no getter; it is what setupOverlayColor bound to unit 1
-        GlStateManager._bindTexture(RenderSystem.getShaderTexture(1));
+            GlStateManager._activeTexture(GL13.GL_TEXTURE0 + 1);
+            mc.gameRenderer.overlayTexture().setupOverlayColor();
+            // the overlay texture has no getter; it is what setupOverlayColor bound to unit 1
+            GlStateManager._bindTexture(RenderSystem.getShaderTexture(1));
 
-        GlStateManager._activeTexture(GL13.GL_TEXTURE0);
-        GlStateManager._bindTexture(modelTexId);
+            GlStateManager._activeTexture(GL13.GL_TEXTURE0);
+            GlStateManager._bindTexture(modelTexId);
 
-        GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, gpu.boneSsbo);
-        GL15.glBufferSubData(GL43.GL_SHADER_STORAGE_BUFFER, 0L, gpu.perFrameBoneBuffer);
-        GL43.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, YsmBoneSkinShader.SSBO, gpu.boneSsbo);
+            GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, gpu.boneSsbo);
+            GL15.glBufferSubData(GL43.GL_SHADER_STORAGE_BUFFER, 0L, gpu.perFrameBoneBuffer);
+            GL43.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, YsmBoneSkinShader.SSBO, gpu.boneSsbo);
 
-        float fogStart = RenderSystem.getShaderFogStart();
-        float fogEnd = RenderSystem.getShaderFogEnd();
-        float[] fogColor = RenderSystem.getShaderFogColor();
-        int fogShape = RenderSystem.getShaderFogShape().getIndex();
+            float fogStart = RenderSystem.getShaderFogStart();
+            float fogEnd = RenderSystem.getShaderFogEnd();
+            float[] fogColor = RenderSystem.getShaderFogColor();
+            int fogShape = RenderSystem.getShaderFogShape().getIndex();
 
-        GlStateManager._glUseProgram(YsmBoneSkinShader.program());
-        if (YsmBoneSkinShader.locProj() >= 0) {
-            GL20.glUniformMatrix4fv(YsmBoneSkinShader.locProj(), false, projScratch);
-        }
-        if (YsmBoneSkinShader.locMv() >= 0) {
-            GL20.glUniformMatrix4fv(YsmBoneSkinShader.locMv(), false, mvScratch);
-        }
-        if (YsmBoneSkinShader.locIvr() >= 0) {
-            GL20.glUniformMatrix3fv(YsmBoneSkinShader.locIvr(), false, ivrScratch);
-        }
-        if (YsmBoneSkinShader.locColor() >= 0) {
-            GL20.glUniform4f(YsmBoneSkinShader.locColor(), r, g, b, a);
-        }
-        if (YsmBoneSkinShader.locOverlay() >= 0) {
-            GL20.glUniform1i(YsmBoneSkinShader.locOverlay(), overlay);
-        }
-        if (YsmBoneSkinShader.locFogStart() >= 0) {
-            GL20.glUniform1f(YsmBoneSkinShader.locFogStart(), fogStart);
-        }
-        if (YsmBoneSkinShader.locFogEnd() >= 0) {
-            GL20.glUniform1f(YsmBoneSkinShader.locFogEnd(), fogEnd);
-        }
-        if (YsmBoneSkinShader.locFogColor() >= 0) {
-            GL20.glUniform4f(YsmBoneSkinShader.locFogColor(), fogColor[0], fogColor[1], fogColor[2], fogColor[3]);
-        }
-        if (YsmBoneSkinShader.locFogShape() >= 0) {
-            GL20.glUniform1i(YsmBoneSkinShader.locFogShape(), fogShape);
-        }
+            GlStateManager._glUseProgram(YsmBoneSkinShader.program());
+            if (YsmBoneSkinShader.locProj() >= 0) {
+                GL20.glUniformMatrix4fv(YsmBoneSkinShader.locProj(), false, projScratch);
+            }
+            if (YsmBoneSkinShader.locMv() >= 0) {
+                GL20.glUniformMatrix4fv(YsmBoneSkinShader.locMv(), false, mvScratch);
+            }
+            if (YsmBoneSkinShader.locIvr() >= 0) {
+                GL20.glUniformMatrix3fv(YsmBoneSkinShader.locIvr(), false, ivrScratch);
+            }
+            if (YsmBoneSkinShader.locColor() >= 0) {
+                GL20.glUniform4f(YsmBoneSkinShader.locColor(), r, g, b, a);
+            }
+            if (YsmBoneSkinShader.locOverlay() >= 0) {
+                GL20.glUniform1i(YsmBoneSkinShader.locOverlay(), overlay);
+            }
+            if (YsmBoneSkinShader.locFogStart() >= 0) {
+                GL20.glUniform1f(YsmBoneSkinShader.locFogStart(), fogStart);
+            }
+            if (YsmBoneSkinShader.locFogEnd() >= 0) {
+                GL20.glUniform1f(YsmBoneSkinShader.locFogEnd(), fogEnd);
+            }
+            if (YsmBoneSkinShader.locFogColor() >= 0) {
+                GL20.glUniform4f(YsmBoneSkinShader.locFogColor(), fogColor[0], fogColor[1], fogColor[2], fogColor[3]);
+            }
+            if (YsmBoneSkinShader.locFogShape() >= 0) {
+                GL20.glUniform1i(YsmBoneSkinShader.locFogShape(), fogShape);
+            }
 
-        refreshLights();
-        if (YsmBoneSkinShader.locLight0() >= 0) {
-            GL20.glUniform3f(YsmBoneSkinShader.locLight0(), currentLights[0].x, currentLights[0].y, currentLights[0].z);
-        }
-        if (YsmBoneSkinShader.locLight1() >= 0) {
-            GL20.glUniform3f(YsmBoneSkinShader.locLight1(), currentLights[1].x, currentLights[1].y, currentLights[1].z);
-        }
-        if (YsmBoneSkinShader.locPartOffset() >= 0) {
-            GL30.glUniform1ui(YsmBoneSkinShader.locPartOffset(), poses.length);
-        }
-        if (YsmBoneSkinShader.locPackedLight() >= 0) {
-            GL20.glUniform1i(YsmBoneSkinShader.locPackedLight(), packedLight);
-        }
+            refreshLights();
+            if (YsmBoneSkinShader.locLight0() >= 0) {
+                GL20.glUniform3f(YsmBoneSkinShader.locLight0(), currentLights[0].x, currentLights[0].y, currentLights[0].z);
+            }
+            if (YsmBoneSkinShader.locLight1() >= 0) {
+                GL20.glUniform3f(YsmBoneSkinShader.locLight1(), currentLights[1].x, currentLights[1].y, currentLights[1].z);
+            }
+            if (YsmBoneSkinShader.locPartOffset() >= 0) {
+                GL30.glUniform1ui(YsmBoneSkinShader.locPartOffset(), poses.length);
+            }
+            if (YsmBoneSkinShader.locPackedLight() >= 0) {
+                GL20.glUniform1i(YsmBoneSkinShader.locPackedLight(), packedLight);
+            }
 
-        GlStateManager._glBindVertexArray(gpu.vao);
-        boolean translucent = YSMMeshLibrary.isTranslucentTexture(texture);
-        if (YsmBoneSkinShader.locAlphaMode() >= 0) {
-            GL20.glUniform1i(YsmBoneSkinShader.locAlphaMode(), 1);
-        }
-        GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, gpu.vertexCount);
-
-        if (translucent) {
-            RenderSystem.enableBlend();
-            RenderSystem.defaultBlendFunc();
+            GlStateManager._glBindVertexArray(gpu.vao);
+            boolean translucent = YSMMeshLibrary.isTranslucentTexture(texture);
             if (YsmBoneSkinShader.locAlphaMode() >= 0) {
-                GL20.glUniform1i(YsmBoneSkinShader.locAlphaMode(), 2);
+                GL20.glUniform1i(YsmBoneSkinShader.locAlphaMode(), 1);
             }
             GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, gpu.vertexCount);
-            RenderSystem.disableBlend();
-        }
 
-        GL43.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, YsmBoneSkinShader.SSBO, 0);
-        GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
-        GlStateManager._glUseProgram(0);
-        BufferUploader.invalidate();
-        GlStateManager._glBindVertexArray(0);
+            if (translucent) {
+                RenderSystem.enableBlend();
+                RenderSystem.defaultBlendFunc();
+                // vanilla translucent semantics: the blended pass must not write
+                // depth (otherwise it occludes entities behind it); restored right
+                // after (the outer mask restore in the finally covers failures)
+                RenderSystem.depthMask(false);
+                if (YsmBoneSkinShader.locAlphaMode() >= 0) {
+                    GL20.glUniform1i(YsmBoneSkinShader.locAlphaMode(), 2);
+                }
+                GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, gpu.vertexCount);
+                RenderSystem.depthMask(true);
+                RenderSystem.disableBlend();
+            }
 
-        mc.gameRenderer.lightTexture().turnOffLightLayer();
-
-        // Restore the state saved before the draw (see the save block above).
-        if (cullEnabled) {
-            RenderSystem.enableCull();
-        } else {
-            RenderSystem.disableCull();
+            logGpuActiveOnce(mesh, gpu);
+            return true;
+        } catch (Throwable t) {
+            // A draw/GL failure must never break the entity render: fall back to
+            // Epic Fight's compute path. The finally below undoes our changes.
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: GPU skinning draw failed, falling back", t);
+            return false;
+        } finally {
+            // Every cleanup is individually guarded: one failing unbind must not
+            // skip the rest of the restore, which is what keeps the frame stable.
+            try {
+                GL43.glBindBufferBase(GL43.GL_SHADER_STORAGE_BUFFER, YsmBoneSkinShader.SSBO, 0);
+            } catch (Throwable ignored) {
+            }
+            try {
+                GL15.glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
+            } catch (Throwable ignored) {
+            }
+            try {
+                GlStateManager._glUseProgram(0);
+            } catch (Throwable ignored) {
+            }
+            try {
+                BufferUploader.invalidate();
+            } catch (Throwable ignored) {
+            }
+            try {
+                GlStateManager._glBindVertexArray(0);
+            } catch (Throwable ignored) {
+            }
+            try {
+                com.ysmef.geomodel.renderer.GlRenderState.restore(glState);
+            } catch (Throwable ignored) {
+            }
+            if (lightLayerOn) {
+                try {
+                    mc.gameRenderer.lightTexture().turnOffLightLayer();
+                } catch (Throwable ignored) {
+                }
+            }
         }
-        if (blendEnabled) {
-            RenderSystem.enableBlend();
-        } else {
-            RenderSystem.disableBlend();
-        }
-        if (depthTestEnabled) {
-            RenderSystem.enableDepthTest();
-        } else {
-            RenderSystem.disableDepthTest();
-        }
-        RenderSystem.depthMask(depthMaskEnabled);
-
-        logGpuActiveOnce(mesh, gpu);
-        return true;
     }
 
     private static final Set<YSMMesh> GPU_ACTIVE_LOGGED = ConcurrentHashMap.newKeySet();
@@ -854,6 +950,11 @@ public final class YsmGpuRenderPath {
             gpu.dispose();
         }
         UNSUPPORTED.remove(mesh);
+        // Drop this mesh's diagnostic state too: those maps are identity-keyed, so
+        // without this they retain every mesh ever drawn (and its GL resources).
+        GPU_SKIP_DIAG.remove(mesh);
+        GPU_INPUT_DIAG.remove(mesh);
+        GPU_ACTIVE_LOGGED.remove(mesh);
     }
 
     /** Free every GPU mesh and per-armature cache (resource reload). Must run on the render thread. */
@@ -868,6 +969,9 @@ public final class YsmGpuRenderPath {
             GPU_MESHES.clear();
         }
         UNSUPPORTED.clear();
+        GPU_SKIP_DIAG.clear();
+        GPU_INPUT_DIAG.clear();
+        GPU_ACTIVE_LOGGED.clear();
         synchronized (TO_ORIGIN_CACHE) {
             TO_ORIGIN_CACHE.clear();
             POSE_LENGTH_CACHE.clear();

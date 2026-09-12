@@ -63,13 +63,32 @@ public final class ScriptJson {
         anim.name = name;
         JsonElement loopEl = animJson.get("loop");
         if (loopEl != null) {
-            if (loopEl.isJsonPrimitive() && loopEl.getAsJsonPrimitive().isBoolean()) {
+            if (loopEl.isJsonObject()) {
+                // Bedrock "loop": { "time": <seconds> } - loop over a fixed window.
+                // The old code fell through to getAsString() on the JsonObject,
+                // which throws UnsupportedOperationException: the exception escaped
+                // mergeScriptAnims and discarded every remaining animation of that
+                // file, not just this entry.
+                anim.loop = ScriptAnim.LOOP_REPEAT;
+                JsonObject loopObj = loopEl.getAsJsonObject();
+                if (loopObj.has("time") && loopObj.get("time").isJsonPrimitive()) {
+                    anim.length = loopObj.get("time").getAsFloat();
+                }
+            } else if (loopEl.isJsonPrimitive() && loopEl.getAsJsonPrimitive().isBoolean()) {
                 anim.loop = loopEl.getAsBoolean() ? ScriptAnim.LOOP_REPEAT : ScriptAnim.LOOP_ONCE;
-            } else if ("hold_on_last_frame".equals(loopEl.getAsString())) {
-                anim.loop = ScriptAnim.LOOP_HOLD;
+            } else if (loopEl.isJsonPrimitive() && loopEl.getAsJsonPrimitive().isString()) {
+                String loopStr = loopEl.getAsString();
+                if ("true".equals(loopStr)) {
+                    anim.loop = ScriptAnim.LOOP_REPEAT;
+                } else if ("hold_on_last_frame".equals(loopStr)) {
+                    anim.loop = ScriptAnim.LOOP_HOLD;
+                }
             }
+            // JsonNull / unknown forms keep LOOP_ONCE (any unrecognized value maps
+            // to play-once), matching the reference serializer.
         }
         if (animJson.has("animation_length")) {
+            // an explicit length wins over the loop-object window
             anim.length = animJson.get("animation_length").getAsFloat();
         }
 

@@ -2,8 +2,6 @@ package com.ysmef.geomodel.model;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.ysmef.geomodel.YSMGeoCompat;
-import com.ysmef.geomodel.cpu.YsmCpuRenderPath;
-import com.ysmef.geomodel.gpu.YsmGpuRenderPath;
 import com.ysmef.geomodel.model.runtime.YsmBindArmature;
 import com.ysmef.geomodel.model.runtime.YSMRuntimeBridge;
 import net.minecraft.client.renderer.MultiBufferSource;
@@ -65,7 +63,8 @@ public class YSMMesh extends HumanoidMesh {
      *
      * Transforms are stored in a flat array indexed by part ordinal: the supplier
      * (read by Epic Fight's per-part transform upload on the GPU path every frame),
-     * the runtime evaluator and the CPU skinning path (YsmCpuRenderPath) all do
+     * the runtime evaluator and the CPU skinning path (registered through
+     * RenderBridgeRegistry) all do
      * O(1) array access instead of a string-keyed map lookup per part per frame.
      */
     private void rebindPartTransforms() {
@@ -168,12 +167,7 @@ public class YSMMesh extends HumanoidMesh {
                 if (captured != null) {
                     yesman.epicfight.model.armature.HumanoidArmature bind = YsmBindArmature.getArmature(this.runtimeModelId, this);
                     if (bind != null) {
-                        yesman.epicfight.api.animation.Pose poseToApply = captured;
-                        if (renderEntity != null) {
-                            poseToApply = YsmBindArmature.correctWheelPose(
-                                    renderEntity.getUUID(), captured, armature, bind);
-                        }
-                        bind.setPose(poseToApply);
+                        bind.setPose(captured);
                         armature = bind;
                         poses = bind.getPoseMatrices();
                         rebindApplied = true;
@@ -181,10 +175,21 @@ public class YSMMesh extends HumanoidMesh {
                 }
             } catch (Throwable t) {
                 // A bind-armature failure must never break the entity render:
-                // fall back to the un-corrected pose path for this draw.
-                YSMGeoCompat.LOGGER.warn(
-                        "YSM-GEO Compat: pose correction failed for model '{}', drawing without it", this.runtimeModelId, t);
+                // fall back to the un-corrected pose path for this draw. Logged
+                // once per model - a single broken model would otherwise print a
+                // full stack trace at frame rate.
+                logPoseCorrectionFailureOnce(this.runtimeModelId, t);
             }
+        }
+        // Defensive: an EntitySnapshot (afterimage / effect snapshot) captures
+        // poseMatrices generated against the armature of that moment. When the
+        // maid switches weapon mid-fight EFTLM swaps in a smaller armature, so
+        // the captured array is longer than the current one and Epic Fight's
+        // compute path would call searchJointById(i) past its joints -> null ->
+        // crash. Clip poses to the current joint count (this also keeps
+        // YSMRuntimeBridge and the compute path on identical data).
+        if (armature != null && poses != null && poses.length > armature.getJointNumber()) {
+            poses = java.util.Arrays.copyOf(poses, armature.getJointNumber());
         }
         try {
             YSMRuntimeBridge.apply(this, armature, poses);
@@ -192,7 +197,8 @@ public class YSMMesh extends HumanoidMesh {
             // ModernYSM-style direct GPU skinning path (bone SSBO + skinning shader):
             // one glDrawArrays per model, vertex skinning fully on the GPU. Falls back
             // to Epic Fight's compute-shader path automatically when unavailable.
-            if (texture != null && YsmGpuRenderPath.tryRender(this, poseStack, bufferSources, texture,
+            RenderBridgeRegistry.GpuSkinRender gpu = RenderBridgeRegistry.gpu();
+            if (texture != null && gpu != null && gpu.tryRender(this, poseStack, bufferSources, texture,
                     packedLight, r, g, b, a, overlay, armature, poses)) {
                 logRebindOnce(rebindApplied);
                 return;
@@ -242,7 +248,9 @@ public class YSMMesh extends HumanoidMesh {
                                        float r, float g, float b, float a, int overlay,
                                        @Nullable Armature armature, OpenMatrix4f[] poses) {
         ComputeShaderSetup setup = poses != null && armature != null ? computeShaderSetup() : null;
-        if (setup != null && !YsmCpuRenderPath.isForced()) {
+        RenderBridgeRegistry.GpuSkinRender gpu = RenderBridgeRegistry.gpu();
+        RenderBridgeRegistry.CpuSkinRender cpu = RenderBridgeRegistry.cpu();
+        if (setup != null && (cpu == null || !cpu.isForced())) {
             int positionCount = this.positions().length / 3;
             // The CPU path skins every visible vertex on the render thread every
             // frame. Large GEO models would spend milliseconds per model there,
@@ -250,14 +258,14 @@ public class YSMMesh extends HumanoidMesh {
             // preferred: its vertex skinning runs on the GPU and its render-thread
             // cost stays bounded in many-maid scenes. GUI entity previews keep
             // the CPU preference (Epic Fight disables its compute pass there).
-            boolean guiEntityPreview = YsmGpuRenderPath.isGuiEntityProjection()
-                    || YsmGpuRenderPath.isYsmPreviewMode();
+            boolean guiEntityPreview = gpu != null
+                    && (gpu.isGuiEntityProjection() || gpu.isYsmPreviewMode());
             if (!guiEntityPreview && positionCount > CPU_PATH_MAX_VERTICES) {
                 logComputePreferredOnce(positionCount);
             }
-            if ((guiEntityPreview || positionCount <= CPU_PATH_MAX_VERTICES)
+            if (cpu != null && (guiEntityPreview || positionCount <= CPU_PATH_MAX_VERTICES)
                     && !(bufferSources instanceof net.minecraft.client.renderer.OutlineBufferSource)
-                    && YsmCpuRenderPath.tryRender(this, poseStack, drawingFunction,
+                    && cpu.tryRender(this, poseStack, drawingFunction,
                             packedLight, r, g, b, a, overlay, armature, poses)) {
                 return;
             }
@@ -335,8 +343,11 @@ public class YSMMesh extends HumanoidMesh {
         if (bufferSources instanceof net.minecraft.client.renderer.OutlineBufferSource) {
             return;
         }
-        YsmCpuRenderPath.tryRenderLastResort(this, poseStack, drawingFunction,
-                packedLight, r, g, b, a, overlay, armature, poses);
+        RenderBridgeRegistry.CpuSkinRender cpu = RenderBridgeRegistry.cpu();
+        if (cpu != null) {
+            cpu.tryRenderLastResort(this, poseStack, drawingFunction,
+                    packedLight, r, g, b, a, overlay, armature, poses);
+        }
     }
 
     private static final Set<String> OVER_CAPACITY_LOGGED = ConcurrentHashMap.newKeySet();
@@ -384,22 +395,54 @@ public class YSMMesh extends HumanoidMesh {
             Field field = SkinnedMesh.class.getDeclaredField("computerShaderSetup");
             field.setAccessible(true);
             return field;
-        } catch (NoSuchFieldException e) {
+        } catch (Throwable t) {
+            // Catch Throwable, not just NoSuchFieldException: setAccessible also
+            // throws InaccessibleObjectException / SecurityException, and this runs
+            // from a static initializer - letting those escape would fail the whole
+            // class with an ExceptionInInitializerError instead of degrading to the
+            // CPU skinning path.
             YSMGeoCompat.LOGGER.error(
-                    "YSM-GEO Compat: Epic Fight's compute shader setup field not found; falling back to CPU skinning", e);
+                    "YSM-GEO Compat: cannot access Epic Fight's compute shader setup field; "
+                            + "falling back to CPU skinning", t);
             return null;
         }
     }
 
+    /** Once per model: the pose-correction failure trace (never per frame). */
+    private static final Set<String> POSE_CORRECTION_FAILED_LOGGED = ConcurrentHashMap.newKeySet();
+
+    private static void logPoseCorrectionFailureOnce(String modelId, Throwable t) {
+        if (POSE_CORRECTION_FAILED_LOGGED.add(modelId == null ? "n/a" : modelId)) {
+            YSMGeoCompat.LOGGER.warn(
+                    "YSM-GEO Compat: pose correction failed for model '{}', drawing without it",
+                    modelId, t);
+        }
+    }
+
+    /**
+     * Per-instance cache of the reflected Epic Fight compute setup. SkinnedMesh
+     * assigns the field during construction and YSMMesh instances are rebuilt after
+     * every resource reload, so caching by instance avoids a reflective Field.get
+     * on every mesh draw while never pinning a stale setup across reloads.
+     */
+    private volatile ComputeShaderSetup cachedComputeSetup;
+    private volatile boolean computeSetupResolved;
+
     @Nullable
     private ComputeShaderSetup computeShaderSetup() {
+        if (computeSetupResolved) {
+            return cachedComputeSetup;
+        }
         if (COMPUTE_SETUP_FIELD == null) {
+            computeSetupResolved = true;
             return null;
         }
         try {
-            return (ComputeShaderSetup) COMPUTE_SETUP_FIELD.get(this);
+            cachedComputeSetup = (ComputeShaderSetup) COMPUTE_SETUP_FIELD.get(this);
         } catch (Throwable t) {
-            return null;
+            cachedComputeSetup = null;
         }
+        computeSetupResolved = true;
+        return cachedComputeSetup;
     }
 }

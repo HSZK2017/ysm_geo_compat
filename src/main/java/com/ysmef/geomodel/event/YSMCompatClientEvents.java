@@ -43,7 +43,9 @@ public class YSMCompatClientEvents {
         }
         YSMMeshLibrary.preparePackFolder();
         event.addRepositorySource((consumer) -> {
-            Pack pack = Pack.create(
+            // Pack.create is non-null for these arguments, so it is consumed
+            // directly instead of behind a null check that can never be false.
+            consumer.accept(Pack.create(
                     "ysm_geo_compat_generated",
                     Component.literal("YSM-GEO Generated Meshes"),
                     true,
@@ -52,10 +54,7 @@ public class YSMCompatClientEvents {
                     PackType.CLIENT_RESOURCES,
                     Pack.Position.TOP,
                     false,
-                    PackSource.BUILT_IN);
-            if (pack != null) {
-                consumer.accept(pack);
-            }
+                    PackSource.BUILT_IN));
         });
     }
 
@@ -66,6 +65,8 @@ public class YSMCompatClientEvents {
     @SubscribeEvent
     public static void onClientSetup(FMLClientSetupEvent event) {
         event.enqueueWork(() -> {
+            // Load the direct draw paths so they self-register (see RenderPaths).
+            com.ysmef.geomodel.renderer.RenderPaths.init();
             try {
                 TlmModelLibrary.resetLazyGeneration();
                 TlmModelLibrary.generateAll(Minecraft.getInstance().getResourceManager());
@@ -93,9 +94,17 @@ public class YSMCompatClientEvents {
             // are regenerated below and the old instances are dropped, so their
             // render-path resources would otherwise leak one dynamic VBO + CPU
             // buffer (CPU path) / one static VBO + bone SSBO (GPU path) per
-            // model per reload.
-            com.ysmef.geomodel.cpu.YsmCpuRenderPath.disposeAll();
-            com.ysmef.geomodel.gpu.YsmGpuRenderPath.disposeAll();
+            // model per reload. Dispatched through the registry so this class
+            // does not have to know which paths exist.
+            YSMMeshLibrary.disposeAllPaths();
+            // Without this the reload was a no-op for textures: the upload-state
+            // map still contained the location, so the bytes re-registered below
+            // were never uploaded and a changed texture only applied after a
+            // restart.
+            YSMMeshLibrary.invalidateAll();
+            // Per-player once-log state (renderer.YSMMeshSelector) is dropped too,
+            // so diagnostics stay useful after a reload.
+            com.ysmef.geomodel.renderer.YSMMeshSelector.clear();
             try {
                 TlmModelLibrary.resetLazyGeneration();
                 TlmModelLibrary.generateAll(resourceManager);

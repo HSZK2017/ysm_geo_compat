@@ -89,167 +89,21 @@ public final class YsmBindArmature {
     /** Models whose bind armature could not be built; not retried until invalidateAll. */
     private static final Set<String> UNSUPPORTED = ConcurrentHashMap.newKeySet();
 
-    /** entity armature instance -> the pose Epic Fight last applied to it. */
-    private static final Map<Armature, Pose> POSES = new HashMap<>();
-
-    /** Players currently playing a converted wheel animation on the composite layer. */
-    private static final Map<java.util.UUID, java.util.Set<String>> WHEEL_JOINTS = new ConcurrentHashMap<>();
+    /**
+     * entity armature instance -> the pose Epic Fight last applied to it.
+     *
+     * Access-ordered so the staleness guard can evict ONE least-recently-used
+     * entry. Clearing the whole map at the cap (the previous behaviour) dropped
+     * every other entity's pose for that frame, silently switching their pose
+     * correction off until the next Armature#setPose.
+     */
+    private static final Map<Armature, Pose> POSES =
+            new java.util.LinkedHashMap<>(64, 0.75f, true);
 
     /** Stale-entry guard: armatures of unloaded entities accumulate otherwise. */
     private static final int POSE_MAP_CAP = 256;
 
     private YsmBindArmature() {}
-
-    // ------------------------------------------------------------------
-    // Wheel-animation pivot correction
-    // ------------------------------------------------------------------
-
-    /**
-     * Register which joints the currently playing converted wheel animation
-     * overrides. Converted wheel clips are authored against Epic Fight's
-     * reference biped armature; when the same pose is re-applied to the bind
-     * armature, those joints need T' = L_bind^-1 x L_ref x T, otherwise the
-     * pivot offset is applied twice and large models tear apart under violent
-     * motion. Joints not overridden by the wheel animation keep the combat pose
-     * unchanged (the bind armature's corrected pivots already handle those).
-     */
-    /** The converted wheel clips are now authored in the same scaled frame as
-     *  the bind armature, so no extra per-joint world snapping is needed. */
-    private static final Set<String> WHEEL_CORRECTION_JOINTS = Set.of();
-
-    public static void setWheelPoseJoints(java.util.UUID playerId, java.util.Set<String> jointNames) {
-        if (playerId == null) {
-            return;
-        }
-        WHEEL_POSE_DIAG.remove(playerId);
-        if (jointNames == null || jointNames.isEmpty()) {
-            WHEEL_JOINTS.remove(playerId);
-        } else {
-            Set<String> filtered = jointNames.stream()
-                    .filter(WHEEL_CORRECTION_JOINTS::contains)
-                    .collect(java.util.stream.Collectors.toSet());
-            if (filtered.isEmpty()) {
-                WHEEL_JOINTS.remove(playerId);
-            } else {
-                WHEEL_JOINTS.put(playerId, Set.copyOf(filtered));
-            }
-        }
-    }
-
-    public static void clearWheelPoseJoints(java.util.UUID playerId) {
-        if (playerId != null) {
-            WHEEL_JOINTS.remove(playerId);
-        }
-    }
-
-    /** Correct the captured pose for the currently active wheel-animation joints. */
-    public static Pose correctWheelPose(
-            java.util.UUID playerId, Pose captured,
-            Armature sourceArmature, Armature targetArmature) {
-        java.util.Set<String> wheelJoints = playerId == null ? null : WHEEL_JOINTS.get(playerId);
-        if (wheelJoints == null || wheelJoints.isEmpty() || captured == null
-                || sourceArmature == null || targetArmature == null
-                || sourceArmature.rootJoint == null || targetArmature.rootJoint == null) {
-            return captured;
-        }
-        Pose corrected =
-                new Pose(new HashMap<>(captured.getJointTransformData()));
-        Map<String, OpenMatrix4f> sourceWorlds = new HashMap<>();
-        collectSourceWorlds(sourceArmature.rootJoint, new OpenMatrix4f(), captured, sourceWorlds);
-        if (correctJointRecursive(targetArmature.rootJoint, new OpenMatrix4f(), captured, corrected,
-                sourceWorlds, wheelJoints)) {
-            if (WHEEL_POSE_DIAG.add(playerId)) {
-                logWheelPoseCorrection(playerId, targetArmature, sourceWorlds, corrected, wheelJoints);
-            }
-            return corrected;
-        }
-        return captured;
-    }
-
-    private static final java.util.Set<java.util.UUID> WHEEL_POSE_DIAG = ConcurrentHashMap.newKeySet();
-
-    private static void logWheelPoseCorrection(java.util.UUID playerId, Armature targetArmature,
-                                               Map<String, OpenMatrix4f> sourceWorlds,
-                                               Pose corrected, Set<String> wheelJoints) {
-        Map<String, OpenMatrix4f> targetWorlds = new HashMap<>();
-        collectPoseWorlds(targetArmature.rootJoint, new OpenMatrix4f(), corrected, targetWorlds);
-        StringBuilder sb = new StringBuilder();
-        sb.append("YSM-GEO Compat: [wheelpose] player=").append(playerId)
-                .append(" armature=").append(targetArmature)
-                .append(" corrected=").append(wheelJoints);
-        for (String name : List.of("Root", "Torso", "Chest", "Head")) {
-            OpenMatrix4f source = sourceWorlds.get(name);
-            OpenMatrix4f target = targetWorlds.get(name);
-            yesman.epicfight.api.animation.JointTransform correctedTransform = corrected.getJointTransformData().get(name);
-            sb.append(' ').append(name).append(" src=").append(fmtMat(source)).append(" tgt=").append(fmtMat(target));
-            if (correctedTransform != null) {
-                sb.append(" corr=").append(fmtMat(correctedTransform.toMatrix()));
-            } else {
-                sb.append(" corr=none");
-            }
-        }
-        YSMGeoCompat.LOGGER.info(sb.toString());
-    }
-
-    private static String fmtMat(OpenMatrix4f m) {
-        if (m == null) {
-            return "null";
-        }
-        return String.format("(%.3f,%.3f,%.3f)", m.m30, m.m31, m.m32);
-    }
-
-    private static void collectSourceWorlds(Joint joint, OpenMatrix4f parentWorld,
-                                            Pose captured, Map<String, OpenMatrix4f> out) {
-        collectPoseWorlds(joint, parentWorld, captured, out);
-    }
-
-    private static void collectPoseWorlds(Joint joint, OpenMatrix4f parentWorld,
-                                          Pose pose, Map<String, OpenMatrix4f> out) {
-        OpenMatrix4f local = new OpenMatrix4f(joint.getLocalTransform());
-        OpenMatrix4f transform = transformOf(pose, joint.getName());
-        OpenMatrix4f parentLocal = OpenMatrix4f.mul(parentWorld, local, null);
-        OpenMatrix4f world = OpenMatrix4f.mul(parentLocal, transform, null);
-        out.put(joint.getName(), world);
-        for (Joint child : joint.getSubJoints()) {
-            collectPoseWorlds(child, world, pose, out);
-        }
-    }
-
-    private static boolean correctJointRecursive(Joint joint, OpenMatrix4f parentTargetWorld,
-                                                 Pose captured, Pose corrected,
-                                                 Map<String, OpenMatrix4f> sourceWorlds,
-                                                 Set<String> wheelJoints) {
-        boolean correctedAny = false;
-        String name = joint.getName();
-        OpenMatrix4f local = new OpenMatrix4f(joint.getLocalTransform());
-        OpenMatrix4f parentLocal = OpenMatrix4f.mul(parentTargetWorld, local, null);
-        OpenMatrix4f world;
-        if (wheelJoints.contains(name) && sourceWorlds.containsKey(name)) {
-            OpenMatrix4f sourceWorld = sourceWorlds.get(name);
-            OpenMatrix4f parentLocalInv = OpenMatrix4f.invert(parentLocal, null);
-            OpenMatrix4f correctedLocal = OpenMatrix4f.mul(parentLocalInv, sourceWorld, null);
-            corrected.putJointData(name,
-                    yesman.epicfight.api.animation.JointTransform.fromMatrix(new OpenMatrix4f(correctedLocal)));
-            world = sourceWorld;
-            correctedAny = true;
-        } else {
-            OpenMatrix4f transform = transformOf(captured, name);
-            world = OpenMatrix4f.mul(parentLocal, transform, null);
-        }
-        for (Joint child : joint.getSubJoints()) {
-            correctedAny |= correctJointRecursive(child, world, captured, corrected, sourceWorlds, wheelJoints);
-        }
-        return correctedAny;
-    }
-
-    private static OpenMatrix4f transformOf(Pose pose, String jointName) {
-        yesman.epicfight.api.animation.JointTransform transform = pose.getJointTransformData().get(jointName);
-        return transform == null ? new OpenMatrix4f() : new OpenMatrix4f(transform.toMatrix());
-    }
-
-    public static void clearWheelAnimationFlags() {
-        WHEEL_JOINTS.clear();
-    }
 
     // ------------------------------------------------------------------
     // Per-frame pose capture
@@ -261,8 +115,13 @@ public final class YsmBindArmature {
             return;
         }
         synchronized (POSES) {
-            if (POSES.size() >= POSE_MAP_CAP) {
-                POSES.clear();
+            while (POSES.size() >= POSE_MAP_CAP) {
+                java.util.Iterator<Armature> oldest = POSES.keySet().iterator();
+                if (!oldest.hasNext()) {
+                    break;
+                }
+                oldest.next();
+                oldest.remove();
             }
             POSES.put(armature, pose);
         }
@@ -322,7 +181,6 @@ public final class YsmBindArmature {
     /** Forget every re-bound armature and captured pose (model reload paths). */
     public static void invalidateAll() {
         BY_MODEL.clear();
-        WHEEL_JOINTS.clear();
         UNSUPPORTED.clear();
         synchronized (POSES) {
             POSES.clear();
@@ -333,30 +191,61 @@ public final class YsmBindArmature {
     // Geometry-driven pivot computation
     // ------------------------------------------------------------------
 
-    private static final int JOINT_ROOT = 0;
-    private static final int JOINT_THIGH_R = 1;
-    private static final int JOINT_LEG_R = 2;
-    private static final int JOINT_KNEE_R = 3;
-    private static final int JOINT_THIGH_L = 4;
-    private static final int JOINT_LEG_L = 5;
-    private static final int JOINT_KNEE_L = 6;
-    private static final int JOINT_TORSO = 7;
-    private static final int JOINT_CHEST = 8;
-    private static final int JOINT_HEAD = 9;
-    private static final int JOINT_SHOULDER_R = 10;
-    private static final int JOINT_ARM_R = 11;
-    private static final int JOINT_HAND_R = 12;
-    private static final int JOINT_TOOL_R = 13;
-    private static final int JOINT_ELBOW_R = 14;
-    private static final int JOINT_SHOULDER_L = 15;
-    private static final int JOINT_ARM_L = 16;
-    private static final int JOINT_HAND_L = 17;
-    private static final int JOINT_TOOL_L = 18;
-    private static final int JOINT_ELBOW_L = 19;
+    // Joint ids come from JointTable (the single source of truth shared with
+    // YSMJointMapper): a renumbered Epic Fight biped can no longer bind geometry
+    // to the wrong joints in one place and not the other.
+    private static final int JOINT_ROOT = com.ysmef.geomodel.model.JointTable.ID_ROOT;
+    private static final int JOINT_THIGH_R = com.ysmef.geomodel.model.JointTable.ID_THIGH_R;
+    private static final int JOINT_LEG_R = com.ysmef.geomodel.model.JointTable.ID_LEG_R;
+    private static final int JOINT_KNEE_R = com.ysmef.geomodel.model.JointTable.ID_KNEE_R;
+    private static final int JOINT_THIGH_L = com.ysmef.geomodel.model.JointTable.ID_THIGH_L;
+    private static final int JOINT_LEG_L = com.ysmef.geomodel.model.JointTable.ID_LEG_L;
+    private static final int JOINT_KNEE_L = com.ysmef.geomodel.model.JointTable.ID_KNEE_L;
+    private static final int JOINT_TORSO = com.ysmef.geomodel.model.JointTable.ID_TORSO;
+    private static final int JOINT_CHEST = com.ysmef.geomodel.model.JointTable.ID_CHEST;
+    private static final int JOINT_HEAD = com.ysmef.geomodel.model.JointTable.ID_HEAD;
+    private static final int JOINT_SHOULDER_R = com.ysmef.geomodel.model.JointTable.ID_SHOULDER_R;
+    private static final int JOINT_ARM_R = com.ysmef.geomodel.model.JointTable.ID_ARM_R;
+    private static final int JOINT_HAND_R = com.ysmef.geomodel.model.JointTable.ID_HAND_R;
+    private static final int JOINT_TOOL_R = com.ysmef.geomodel.model.JointTable.ID_TOOL_R;
+    private static final int JOINT_ELBOW_R = com.ysmef.geomodel.model.JointTable.ID_ELBOW_R;
+    private static final int JOINT_SHOULDER_L = com.ysmef.geomodel.model.JointTable.ID_SHOULDER_L;
+    private static final int JOINT_ARM_L = com.ysmef.geomodel.model.JointTable.ID_ARM_L;
+    private static final int JOINT_HAND_L = com.ysmef.geomodel.model.JointTable.ID_HAND_L;
+    private static final int JOINT_TOOL_L = com.ysmef.geomodel.model.JointTable.ID_TOOL_L;
+    private static final int JOINT_ELBOW_L = com.ysmef.geomodel.model.JointTable.ID_ELBOW_L;
 
     /** Normalized bone names that denote the hand bone itself (its top = the wrist). */
     private static final Set<String> HAND_BONE_NAMES = new HashSet<>(List.of(
             "righthand", "handright", "lefthand", "handleft"));
+
+    /**
+     * Directly-mapped accessory bones whose geometry extends far beyond the body
+     * (a cape/wing reaches above the head, a backpack sits behind/above the
+     * shoulders), so they must not contribute to the segment pivots - otherwise
+     * the "neck" (top of the chest geometry) lands on the accessory and the head
+     * detaches from the body.
+     *
+     * Only reachable through the unmapped fallback tier: these names resolve to
+     * the Chest joint by walking the ancestor chain, and a model can also map
+     * them directly, in which case they are excluded here too.
+     */
+    private static final Set<String> PIVOT_EXCLUDED_BONE_NAMES = new HashSet<>(List.of(
+            "cape", "elytra", "elytralocator", "backpack"));
+
+    /**
+     * Weapon-ish name fragments excluded from the geometry collection: a held
+     * item (sword, spoon, phone...) resolves to the Hand joint but extends far
+     * past the fist, so it must not drag the elbow/wrist pivot - and, in the
+     * unmapped fallback tier, must not become the only "hand geometry" of a
+     * model whose real hand bones carry no name the joint mapper knows.
+     */
+    private static final String[] WEAPON_NAME_PARTS = {
+            "sword", "gun", "weapon", "blade", "knife", "axe", "bow", "tool", "item", "besom", "key", "wand",
+            "staff", "spear", "dagger", "katana", "shield", "scythe", "sickle", "hammer", "pole", "stick",
+            "spoon", "fork", "cup", "coaster", "phone", "computer", "book", "grimoire", "lantern", "circle",
+            "arrow", "quiver", "mic"
+    };
 
     /** Ring height tolerance for the segment-top centroid (Minecraft frame, up = +Y). */
     private static final float TOP_RING_EPSILON = 0.05f;
@@ -381,13 +270,15 @@ public final class YsmBindArmature {
             return null;
         }
 
-        Map<Integer, List<Vector3f>> byBone = collectGeometry(runtime, mesh);
+        GeometryData geometry = collectGeometry(runtime, mesh);
+        Map<Integer, List<Vector3f>> byJoint = geometry.byJoint();
+        Map<Integer, List<Vector3f>> byBone = geometry.byBone();
 
         // Segment pivots derived from the model's own geometry (Minecraft frame).
-        Vector3f thighR = topOf(geometryOf(byBone, runtime, JOINT_THIGH_R));
-        Vector3f thighL = topOf(geometryOf(byBone, runtime, JOINT_THIGH_L));
+        Vector3f thighR = topOf(geometryOf(byJoint, JOINT_THIGH_R));
+        Vector3f thighL = topOf(geometryOf(byJoint, JOINT_THIGH_L));
         Vector3f hip = midpoint(thighR, thighL);
-        Vector3f neck = topOf(geometryOf(byBone, runtime, JOINT_CHEST));
+        Vector3f neck = topOf(geometryOf(byJoint, JOINT_CHEST));
         // Chest-geometry degradation: models without a chest/upper-body bone
         // (the tiny Touhou Q-style maids have only head/body/limb bones) leave
         // the Chest joint empty, so its "top" is null or sits at hip height.
@@ -395,7 +286,7 @@ public final class YsmBindArmature {
         // head far above the model. Derive the neck from the model instead: the
         // midpoint between the hip and the top of the head geometry.
         if (neck == null || hip == null || neck.y <= hip.y + CHEST_TOP_MIN_ABOVE_HIP) {
-            Vector3f headTop = topOf(geometryOf(byBone, runtime, JOINT_HEAD));
+            Vector3f headTop = topOf(geometryOf(byJoint, JOINT_HEAD));
             neck = headTop != null && hip != null ? midpoint(hip, headTop) : null;
         }
         // Anchor the neck's x/z on the hip center line. The Chest joint's
@@ -409,12 +300,12 @@ public final class YsmBindArmature {
             neck = new Vector3f(hip.x, neck.y, hip.z);
         }
         Vector3f chest = midpoint(hip, neck);
-        Vector3f kneeR = topOf(geometryOf(byBone, runtime, JOINT_LEG_R));
-        Vector3f kneeL = topOf(geometryOf(byBone, runtime, JOINT_LEG_L));
-        Vector3f shoulderR = topOf(geometryOf(byBone, runtime, JOINT_ARM_R));
-        Vector3f shoulderL = topOf(geometryOf(byBone, runtime, JOINT_ARM_L));
-        Vector3f elbowR = topOf(geometryOf(byBone, runtime, JOINT_HAND_R));
-        Vector3f elbowL = topOf(geometryOf(byBone, runtime, JOINT_HAND_L));
+        Vector3f kneeR = topOf(geometryOf(byJoint, JOINT_LEG_R));
+        Vector3f kneeL = topOf(geometryOf(byJoint, JOINT_LEG_L));
+        Vector3f shoulderR = topOf(geometryOf(byJoint, JOINT_ARM_R));
+        Vector3f shoulderL = topOf(geometryOf(byJoint, JOINT_ARM_L));
+        Vector3f elbowR = topOf(geometryOf(byJoint, JOINT_HAND_R));
+        Vector3f elbowL = topOf(geometryOf(byJoint, JOINT_HAND_L));
         Vector3f wristR = handPivot(runtime, byBone, JOINT_HAND_R);
         Vector3f wristL = handPivot(runtime, byBone, JOINT_HAND_L);
 
@@ -426,16 +317,16 @@ public final class YsmBindArmature {
         // (shoulder/hip) and the segment bottom - exactly the real joint when
         // the whole limb is one bone.
         if (kneeR == null) {
-            kneeR = midpoint(thighR, bottomOf(geometryOf(byBone, runtime, JOINT_THIGH_R)));
+            kneeR = midpoint(thighR, bottomOf(geometryOf(byJoint, JOINT_THIGH_R)));
         }
         if (kneeL == null) {
-            kneeL = midpoint(thighL, bottomOf(geometryOf(byBone, runtime, JOINT_THIGH_L)));
+            kneeL = midpoint(thighL, bottomOf(geometryOf(byJoint, JOINT_THIGH_L)));
         }
         if (elbowR == null) {
-            elbowR = midpoint(shoulderR, bottomOf(geometryOf(byBone, runtime, JOINT_ARM_R)));
+            elbowR = midpoint(shoulderR, bottomOf(geometryOf(byJoint, JOINT_ARM_R)));
         }
         if (elbowL == null) {
-            elbowL = midpoint(shoulderL, bottomOf(geometryOf(byBone, runtime, JOINT_ARM_L)));
+            elbowL = midpoint(shoulderL, bottomOf(geometryOf(byJoint, JOINT_ARM_L)));
         }
 
         Map<Integer, OpenMatrix4f> pivots = new HashMap<>();
@@ -541,14 +432,44 @@ public final class YsmBindArmature {
     }
 
     /**
-     * Collect the bind-pose geometry of every mesh part, keyed by the runtime
-     * bone index. At runtime the mesh positions are in Minecraft frame (up = +Y,
-     * Epic Fight's loader rotated them out of the JSON's Blender frame while
-     * loading), the same frame the pivot matrices are expressed in.
+     * Collect the bind-pose geometry of every mesh part, keyed both by the
+     * runtime bone index (for the hand-bone lookup) and by EF joint (for the
+     * segment pivots). At runtime the mesh positions are in Minecraft frame
+     * (up = +Y, Epic Fight's loader rotated them out of the JSON's Blender frame
+     * while loading), the same frame the pivot matrices are expressed in.
+     *
+     * The joint map is two-tier. Directly-mapped body bones fill the preferred
+     * tier, and every other bone fills the fallback tier; a joint is served from
+     * the preferred tier when it has anything there and from the fallback tier
+     * only when it has nothing at all.
+     *
+     * The fallback tier is what makes models with unrecognized bone naming work.
+     * A model authored in Chinese ("头", "左手") maps almost no bone directly, so
+     * a mapped-only collection left every segment pivot empty and the whole
+     * armature fell back to Steve's adult proportions - the model then bends at
+     * points that are not its joints. The fallback still resolves each bone to a
+     * joint through its ancestor chain, so it supplies geometry for exactly the
+     * joints the model itself has no better answer for.
+     *
+     * The tiering is also why the filters below matter more than they did: with
+     * the fallback in place, a decorative or held-item bone can now reach a
+     * joint that previously stayed empty. So variant bones (alternate forms),
+     * bones hidden in the default form, accessories and weapon bones are all
+     * dropped before either tier is filled.
      */
-    private static Map<Integer, List<Vector3f>> collectGeometry(YSMRuntimeModel runtime, YSMMesh mesh) {
+    private static GeometryData collectGeometry(YSMRuntimeModel runtime, YSMMesh mesh) {
+        Map<Integer, List<Vector3f>> mappedByJoint = new HashMap<>();
+        Map<Integer, List<Vector3f>> unmappedByJoint = new HashMap<>();
         Map<Integer, List<Vector3f>> byBone = new HashMap<>();
         float[] positions = mesh.positions();
+
+        // Names of the bones hidden in the model's default (battle-mode) form:
+        // those parts never render, so their geometry must not pollute the
+        // segment pivots - e.g. a shipgirl's rigging (hidden by default) sits
+        // forward of the chest and would otherwise drag the neck pivot off the
+        // body, and a hidden variant's bound geometry sits at the base form's
+        // or a completely different position.
+        Set<String> hiddenBones = runtime.defaultHiddenBoneNames();
 
         // Pass 1: count the bind-pose vertices of every bone and collect the raw
         // (case-preserving) bone names. The counts tell alternate-form variant
@@ -585,12 +506,13 @@ public final class YsmBindArmature {
                 continue;
             }
             YSMRuntimeModel.BoneRt bone = runtime.bones[boneIdx];
-            // Only directly-mapped body bones define segment pivots: decorations
-            // (tails, bows, capes...) resolve to a joint by walking up their
-            // ancestor chain (mapped=false) and their geometry can extend far
-            // beyond the body part - e.g. the wine_fox's up-curled tail reaches
-            // ABOVE the head and would become the "neck".
-            if (!bone.mapped) {
+            if (hiddenBones.contains(bone.name)) {
+                continue;
+            }
+            if (PIVOT_EXCLUDED_BONE_NAMES.contains(normalize(bone.name))) {
+                continue;
+            }
+            if (isWeaponBone(normalize(bone.name))) {
                 continue;
             }
             // Alternate-form variant bones ("RightLeg2", "Head2"...) carry bind
@@ -613,15 +535,52 @@ public final class YsmBindArmature {
                     continue;
                 }
             }
-            List<Vector3f> list = byBone.computeIfAbsent(boneIdx, k -> new ArrayList<>());
+            List<Vector3f> boneList = byBone.computeIfAbsent(boneIdx, k -> new ArrayList<>());
+            Map<Integer, List<Vector3f>> target = bone.mapped ? mappedByJoint : unmappedByJoint;
+            List<Vector3f> list = target.computeIfAbsent(bone.joint, k -> new ArrayList<>());
             for (VertexBuilder vb : entry.getValue().getVertices()) {
                 int p = vb.position * 3;
                 if (p + 2 < positions.length) {
-                    list.add(new Vector3f(positions[p], positions[p + 1], positions[p + 2]));
+                    Vector3f v = new Vector3f(positions[p], positions[p + 1], positions[p + 2]);
+                    boneList.add(v);
+                    list.add(v);
                 }
             }
         }
-        return byBone;
+
+        // Per joint: prefer the mapped geometry; fall back to the unmapped bones
+        // only when the joint has no mapped geometry at all.
+        Map<Integer, List<Vector3f>> byJoint = new HashMap<>(unmappedByJoint);
+        for (Map.Entry<Integer, List<Vector3f>> entry : mappedByJoint.entrySet()) {
+            if (!entry.getValue().isEmpty()) {
+                byJoint.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return new GeometryData(byJoint, byBone);
+    }
+
+    /**
+     * byJoint: joint-indexed geometry (mapped preferred, unmapped as the
+     * fallback) for the segment pivots; byBone: bone-indexed for the hand-bone
+     * lookup.
+     */
+    private record GeometryData(Map<Integer, List<Vector3f>> byJoint, Map<Integer, List<Vector3f>> byBone) {}
+
+    private static boolean isWeaponBone(String normalized) {
+        // "bow" must not match "elbow": an elbow is body geometry, and dropping
+        // it would empty the joint (or thin out the arm's fallback geometry) for
+        // any model that names its forearm bones after the elbow. A held bow is
+        // named for the item ("bow", "itembow", "bow_left"), never for the joint
+        // it hangs from.
+        if (normalized.contains("elbow")) {
+            return false;
+        }
+        for (String part : WEAPON_NAME_PARTS) {
+            if (normalized.contains(part)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean isDigitSuffixed(String boneName) {
@@ -637,16 +596,9 @@ public final class YsmBindArmature {
         return boneName.substring(0, end);
     }
 
-    /** All bind-pose vertices bound to one EF joint. */
-    private static List<Vector3f> geometryOf(Map<Integer, List<Vector3f>> byBone,
-                                             YSMRuntimeModel runtime, int joint) {
-        List<Vector3f> merged = new ArrayList<>();
-        for (Map.Entry<Integer, List<Vector3f>> entry : byBone.entrySet()) {
-            if (runtime.bones[entry.getKey()].joint == joint) {
-                merged.addAll(entry.getValue());
-            }
-        }
-        return merged;
+    /** All bind-pose vertices bound to one EF joint (mapped geometry preferred). */
+    private static List<Vector3f> geometryOf(Map<Integer, List<Vector3f>> byJoint, int joint) {
+        return byJoint.get(joint);
     }
 
     /**
@@ -724,14 +676,14 @@ public final class YsmBindArmature {
         return null;
     }
 
-    /** Mirrors YSMJointMapper's name normalization (lower case, no spaces/underscores, no trailing digits). */
+    /**
+     * Delegates to the project's single normalization (YSMJointMapper). This class
+     * used to carry its own copy that omitted the default-form suffix strip, so
+     * "LeftHand_Default" never matched HAND_BONE_NAMES and the wrist pivot fell
+     * back to the elbow (held weapons floating).
+     */
     private static String normalize(String boneName) {
-        String normalized = boneName.toLowerCase().replace("_", "").replace(" ", "");
-        int end = normalized.length();
-        while (end > 0 && Character.isDigit(normalized.charAt(end - 1))) {
-            end--;
-        }
-        return normalized.substring(0, end);
+        return com.ysmef.geomodel.model.YSMJointMapper.normalizeBoneName(boneName);
     }
 
     private static Vector3f midpoint(Vector3f a, Vector3f b) {

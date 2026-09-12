@@ -49,8 +49,12 @@ public abstract class YsmMaidRendererMixin {
      */
     private static final java.util.Set<String> LOGGED_SOURCES = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
+    // require = 0: the target method belongs to an optional mod, so a signature
+    // change in EpicFight_TouhouLittleMaid must degrade to "no maid mesh
+    // substitution" instead of failing the injection (the config's
+    // defaultRequire=1 would otherwise report an injection error every launch).
     @Inject(method = "getMeshProvider(Lnet/EFTLM/EF/Capability/MaidPatch;)Lyesman/epicfight/api/asset/AssetAccessor;",
-            at = @At("HEAD"), cancellable = true, remap = false)
+            at = @At("HEAD"), cancellable = true, remap = false, require = 0)
     private void ysmef$useTlmMesh(MaidPatch<EntityMaid> maidPatch,
                                   CallbackInfoReturnable<AssetAccessor<MaidMesh>> cir) {
         EntityMaid maid = maidPatch.getOriginal();

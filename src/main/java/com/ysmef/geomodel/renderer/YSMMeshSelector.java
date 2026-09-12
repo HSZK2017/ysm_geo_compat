@@ -10,7 +10,8 @@ import yesman.epicfight.api.asset.AssetAccessor;
 import yesman.epicfight.api.client.model.Meshes;
 import yesman.epicfight.client.mesh.HumanoidMesh;
 
-import java.util.Set;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -23,9 +24,21 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class YSMMeshSelector {
 
-    private static final Set<String> LOGGED_MESH_USE = ConcurrentHashMap.newKeySet();
+    /**
+     * Last logged (modelId, textureName) pair per entity. This runs every frame
+     * per drawn maid, so the pair is compared against the cached one instead of
+     * building a "uuid|modelId|texture" string every frame - and the set stays
+     * bounded by the number of entities instead of growing per distinct
+     * combination seen.
+     */
+    private static final Map<UUID, String[]> LOGGED_MESH_USE = new ConcurrentHashMap<>();
 
     private YSMMeshSelector() {}
+
+    /** Forget per-player once-log state (resource reload / world leave). */
+    public static void clear() {
+        LOGGED_MESH_USE.clear();
+    }
 
     /**
      * Shared core: apply the runtime model id, current entity and texture
@@ -41,6 +54,9 @@ public final class YSMMeshSelector {
         }
         try {
             YSMMesh mesh = accessor.get();
+            // The mesh now owns GL resources (whether it was built here or
+            // re-loaded after an eviction), so record it for the LRU cache.
+            YSMMeshLibrary.markMeshLoaded(modelId);
             mesh.setRuntimeModelId(modelId);
             YSMRuntimeBridge.setCurrentEntity(entity);
             if (texture != null) {
@@ -62,11 +78,15 @@ public final class YSMMeshSelector {
 
     private static void logMeshUsedOnce(LivingEntity entity, String modelId, String textureName,
                                         ResourceLocation texture, String displayName) {
-        String key = entity.getUUID() + "|" + modelId + "|" + textureName;
-        if (LOGGED_MESH_USE.add(key)) {
-            YSMGeoCompat.LOGGER.info(
-                    "YSM-GEO Compat: rendering '{}' with converted TLM base mesh (model='{}', texture='{}' -> {})",
-                    displayName, modelId, textureName, texture);
+        // Runs every frame per drawn maid: compare against the cached pair rather
+        // than building a "uuid|modelId|texture" string every frame.
+        String[] prev = LOGGED_MESH_USE.get(entity.getUUID());
+        if (prev != null && prev[0].equals(modelId) && java.util.Objects.equals(prev[1], textureName)) {
+            return;
         }
+        LOGGED_MESH_USE.put(entity.getUUID(), new String[]{modelId, textureName});
+        YSMGeoCompat.LOGGER.info(
+                "YSM-GEO Compat: rendering '{}' with converted TLM base mesh (model='{}', texture='{}' -> {})",
+                displayName, modelId, textureName, texture);
     }
 }

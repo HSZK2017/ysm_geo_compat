@@ -95,7 +95,7 @@ public class EFMeshJsonWriter {
         int[] quadCount = {0};
         for (YSMGeoModel.Bone rootBone : geoModel.topLevelBones) {
             walkBone(rootBone, new Matrix4f(), scaleW, scaleH, dedup,
-                    positions, normals, uvs, vcounts, vindices, partIndices, quadCount);
+                    positions, normals, uvs, vcounts, vindices, partIndices, quadCount, 0);
         }
 
         if (positions.isEmpty()) {
@@ -204,7 +204,15 @@ public class EFMeshJsonWriter {
                                  Map<VertexKey, Integer> dedup,
                                  List<Float> positions, List<Float> normals, List<Float> uvs,
                                  List<Integer> vcounts, List<Integer> vindices,
-                                 Map<String, List<Integer>> partIndices, int[] quadCount) {
+                                 Map<String, List<Integer>> partIndices, int[] quadCount, int depth) {
+        if (depth > YSMGeoModel.MAX_BONE_DEPTH) {
+            // Guards the mesh writer against a hierarchy the parsers let through:
+            // without it a deep/cyclic chain dies here with a StackOverflowError
+            // (an Error, so the caller's catch (Exception) would not stop it),
+            // leaving a half-written mesh file behind.
+            throw new IllegalStateException(
+                    "bone hierarchy deeper than " + YSMGeoModel.MAX_BONE_DEPTH + " while writing the mesh");
+        }
         // TLM conditional parts (see isTlmConditionalBone): pieces the TLM
         // animation system shows/hides at runtime (blink faces, task/status
         // markers, armor plates, yukari's gap...). This mod does not play TLM's
@@ -275,7 +283,7 @@ public class EFMeshJsonWriter {
 
         for (YSMGeoModel.Bone child : bone.children) {
             walkBone(child, boneTransform, scaleW, scaleH, dedup,
-                    positions, normals, uvs, vcounts, vindices, partIndices, quadCount);
+                    positions, normals, uvs, vcounts, vindices, partIndices, quadCount, depth + 1);
         }
     }
 
@@ -331,14 +339,9 @@ public class EFMeshJsonWriter {
         return false;
     }
 
-    /** Lower case, spaces/underscores removed, trailing digits stripped (mirrors YSMJointMapper). */
+    /** Lower case, spaces/underscores removed, trailing digits stripped (see YSMJointMapper). */
     private static String normalizeBoneName(String boneName) {
-        String normalized = boneName.toLowerCase().replace("_", "").replace(" ", "");
-        int end = normalized.length();
-        while (end > 0 && Character.isDigit(normalized.charAt(end - 1))) {
-            end--;
-        }
-        return normalized.substring(0, end);
+        return YSMJointMapper.normalizeBoneName(boneName);
     }
 
     private static JsonObject partArray(List<Integer> indices) {

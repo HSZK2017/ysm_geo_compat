@@ -85,6 +85,13 @@ public final class YsmCpuRenderPath {
     // Epic Fight's own drawPosed uses for its static scratch vectors.
     private static OpenMatrix4f[] TOTAL = allocateScratch(32);
     private static final OpenMatrix4f jointScratch = new OpenMatrix4f();
+    /**
+     * Reused skinning matrix of one rigid part (see {@link #tryPrecomputePartMatrix}).
+     * Converted meshes bind every vertex of a part to a single EF joint with
+     * weight 1, so this is constant for the whole part - computing it once
+     * instead of per vertex is the bulk of the CPU path's win.
+     */
+    private static final OpenMatrix4f partScratch = new OpenMatrix4f();
     private static final Vec4f POS4 = new Vec4f();
     private static final Vec4f NRM4 = new Vec4f();
     private static final Vec4f ACC4 = new Vec4f();
@@ -116,7 +123,7 @@ public final class YsmCpuRenderPath {
                     mesh.getRuntimeModelId(), reason);
             return;
         }
-        if (changed && Boolean.getBoolean("ysm_geo_compat.diag")) {
+        if (changed && com.ysmef.geomodel.config.YSMCompatConfig.DIAG) {
             YSMGeoCompat.LOGGER.info(
                     "YSM-GEO Compat: [diag] CPU path skip: model={} reason={}", mesh.getRuntimeModelId(), reason);
         }
@@ -126,6 +133,54 @@ public final class YsmCpuRenderPath {
     private static boolean failureLogged = false;
 
     private YsmCpuRenderPath() {}
+
+    /**
+     * No-op that forces this class to initialize, i.e. to register itself with
+     * the release/dispatch registries. Called once from
+     * {@link com.ysmef.geomodel.renderer.RenderPaths#init()}.
+     */
+    public static void warmUp() {
+    }
+
+    // Registered on first class load: release through MeshReleaser, dispatch
+    // through RenderBridgeRegistry (see the GPU path's block for the rationale).
+    static {
+        com.ysmef.geomodel.model.YSMMeshLibrary.registerMeshReleaser(new com.ysmef.geomodel.model.MeshReleaser() {
+            @Override
+            public void disposeMesh(YSMMesh mesh) {
+                YsmCpuRenderPath.disposeMesh(mesh);
+            }
+
+            @Override
+            public void disposeAll() {
+                YsmCpuRenderPath.disposeAll();
+            }
+        });
+        com.ysmef.geomodel.model.RenderBridgeRegistry.registerCpu(
+                new com.ysmef.geomodel.model.RenderBridgeRegistry.CpuSkinRender() {
+                    @Override
+                    public boolean isForced() {
+                        return YsmCpuRenderPath.isForced();
+                    }
+
+                    @Override
+                    public boolean tryRender(YSMMesh mesh, PoseStack poseStack, Mesh.DrawingFunction drawingFunction,
+                                             int packedLight, float r, float g, float b, float a, int overlay,
+                                             Armature armature, OpenMatrix4f[] poses) {
+                        return YsmCpuRenderPath.tryRender(mesh, poseStack, drawingFunction,
+                                packedLight, r, g, b, a, overlay, armature, poses);
+                    }
+
+                    @Override
+                    public boolean tryRenderLastResort(YSMMesh mesh, PoseStack poseStack,
+                                                       Mesh.DrawingFunction drawingFunction,
+                                                       int packedLight, float r, float g, float b, float a, int overlay,
+                                                       Armature armature, OpenMatrix4f[] poses) {
+                        return YsmCpuRenderPath.tryRenderLastResort(mesh, poseStack, drawingFunction,
+                                packedLight, r, g, b, a, overlay, armature, poses);
+                    }
+                });
+    }
 
     /**
      * Whether the user forced the CPU skinning path through the
@@ -201,8 +256,13 @@ public final class YsmCpuRenderPath {
             cpuSkipDiag(mesh, "no-poses");
             return false;
         }
-        if (shaderPackInUse() && !lastResort) {
-            // under a shader pack the custom program would bypass the pack's shaders
+        boolean guiPreview = com.ysmef.geomodel.gpu.YsmGpuRenderPath.isGuiEntityProjection()
+                || com.ysmef.geomodel.gpu.YsmGpuRenderPath.isYsmPreviewMode();
+        if (shaderPackInUse() && !lastResort && !guiPreview) {
+            // under a shader pack the custom program would bypass the pack's shaders.
+            // GUI entity previews are the exception: the pack's entity shader never
+            // draws them, so this plain vertex-pipeline draw is the correct (and
+            // only) way to render them.
             cpuSkipDiag(mesh, "shader-pack-in-use");
             return false;
         }
@@ -319,14 +379,139 @@ public final class YsmCpuRenderPath {
                 continue;
             }
             OpenMatrix4f delta = mesh.getPartTransform(partIdx);
-            for (VertexBuilder vb : part.getVertices()) {
-                skinVertex(buf, vb, positions, normals, uvs, jointCounts, jointIndices, weightIndices,
-                        weights, total, jointCount, delta, pose, normalMat);
+            if (tryPrecomputePartMatrix(part, jointCounts, jointIndices, weightIndices, weights,
+                    total, jointCount, delta, partScratch)) {
+                // Rigid single-joint part: the final skinning matrix is constant
+                // for the whole part - one inline transform per vertex.
+                for (VertexBuilder vb : part.getVertices()) {
+                    skinVertexRigid(buf, vb, positions, normals, uvs, partScratch, pose, normalMat);
+                }
+            } else {
+                // Multi-joint or partially corrupt part: per-vertex weighted loop.
+                for (VertexBuilder vb : part.getVertices()) {
+                    skinVertex(buf, vb, positions, normals, uvs, jointCounts, jointIndices, weightIndices,
+                            weights, total, jointCount, delta, pose, normalMat);
+                }
             }
             partIdx++;
         }
         buf.flip();
         return buf.limit() / YsmCpuMesh.VERTEX_STRIDE;
+    }
+
+    /**
+     * Precompute the per-part skinning matrix (pose_j x toOrigin_j x partDelta)
+     * when every vertex of the part is rigidly bound to the SAME joint with
+     * weight ~1 - the layout the converted meshes always use. Returns false when
+     * the part needs the per-vertex weighted path.
+     */
+    private static boolean tryPrecomputePartMatrix(SkinnedMeshPart part, int[] jointCounts, int[][] jointIndices,
+                                                   int[][] weightIndices, float[] weights, OpenMatrix4f[] total,
+                                                   int jointCount, @Nullable OpenMatrix4f delta,
+                                                   OpenMatrix4f out) {
+        int joint = -1;
+        for (VertexBuilder vb : part.getVertices()) {
+            int posIdx = vb.position;
+            if (posIdx >= jointCounts.length || posIdx >= jointIndices.length || posIdx >= weightIndices.length
+                    || jointCounts[posIdx] != 1 || jointIndices[posIdx].length < 1 || weightIndices[posIdx].length < 1) {
+                return false;
+            }
+            int j = jointIndices[posIdx][0];
+            int wi = weightIndices[posIdx][0];
+            float w = wi < weights.length ? weights[wi] : 0.0F;
+            if (j < 0 || j >= jointCount || w < 0.999f) {
+                return false;
+            }
+            if (joint < 0) {
+                joint = j;
+            } else if (joint != j) {
+                return false;
+            }
+        }
+        if (joint < 0) {
+            // empty part (the converted meshes carry empty base parts like
+            // head/torso): nothing to skin, let the vertex loop do nothing
+            return false;
+        }
+        out.load(total[joint]);
+        if (delta != null) {
+            out.mulBack(delta);
+        }
+        return true;
+    }
+
+    /**
+     * Skin one rigidly-bound vertex with the precomputed part matrix and append
+     * it (pos 3f, uv 2f, packed normal). The transform is inlined with the
+     * OpenMatrix4f row-vector storage convention (the same formula as
+     * OpenMatrix4f.transform) - the hot path for every vertex of a converted mesh.
+     */
+    private static void skinVertexRigid(ByteBuffer buf, VertexBuilder vb, float[] positions, float[] normals,
+                                        float[] uvs, OpenMatrix4f m, Matrix4f pose, Matrix3f normalMat) {
+        int posIdx = vb.position;
+        int normIdx = vb.normal;
+        int uvIdx = vb.uv;
+
+        if (posIdx * 3 + 2 >= positions.length || normIdx * 3 + 2 >= normals.length
+                || uvIdx * 2 + 1 >= uvs.length) {
+            // Corrupt index triple: keep this vertex slot so the rest of the model
+            // stays correctly indexed (EF's CPU path would crash).
+            emitDegenerateVertex(buf);
+        }
+
+        float x0 = positions[posIdx * 3];
+        float y0 = positions[posIdx * 3 + 1];
+        float z0 = positions[posIdx * 3 + 2];
+        float px = m.m00 * x0 + m.m10 * y0 + m.m20 * z0 + m.m30;
+        float py = m.m01 * x0 + m.m11 * y0 + m.m21 * z0 + m.m31;
+        float pz = m.m02 * x0 + m.m12 * y0 + m.m22 * z0 + m.m32;
+
+        float nx0 = normals[normIdx * 3];
+        float ny0 = normals[normIdx * 3 + 1];
+        float nz0 = normals[normIdx * 3 + 2];
+        // w = 0: the translation row drops out
+        float nx = m.m00 * nx0 + m.m10 * ny0 + m.m20 * nz0;
+        float ny = m.m01 * nx0 + m.m11 * ny0 + m.m21 * nz0;
+        float nz = m.m02 * nx0 + m.m12 * ny0 + m.m22 * nz0;
+
+        if (Float.isNaN(px) || Float.isNaN(py) || Float.isNaN(pz)
+                || Float.isNaN(nx) || Float.isNaN(ny) || Float.isNaN(nz)) {
+            // A NaN part transform would make this whole part vanish on every
+            // render path; emit a degenerate vertex to keep the frame stable.
+            emitDegenerateVertex(buf);
+        }
+
+        // Apply the poseStack on the CPU (same contract as Epic Fight's drawPosed:
+        // the vertex arrives at the shader in camera space, so the shader only
+        // applies the plain RenderSystem proj/modelView like the vanilla entity
+        // shader does).
+        POS4J.set(px, py, pz, 1.0F);
+        POS4J.mul(pose);
+        NRM3.set(nx, ny, nz);
+        NRM3.mul(normalMat);
+
+        // normalize (EF's drawPosed does not; skipping it shades the skinned
+        // model inconsistently), falling back to +Z for a degenerate normal
+        float len = (float) Math.sqrt(NRM3.x * NRM3.x + NRM3.y * NRM3.y + NRM3.z * NRM3.z);
+        float nX;
+        float nY;
+        float nZ;
+        if (len < 1.0e-6F || Float.isNaN(len)) {
+            nX = 0.0F;
+            nY = 0.0F;
+            nZ = 1.0F;
+        } else {
+            nX = NRM3.x / len;
+            nY = NRM3.y / len;
+            nZ = NRM3.z / len;
+        }
+
+        buf.putFloat(POS4J.x);
+        buf.putFloat(POS4J.y);
+        buf.putFloat(POS4J.z);
+        buf.putFloat(uvs[uvIdx * 2]);
+        buf.putFloat(uvs[uvIdx * 2 + 1]);
+        buf.putInt(packNormal(nX, nY, nZ));
     }
 
     /** Skin one vertex, apply the poseStack, and append it (pos 3f, uv 2f, packed normal) to the buffer. */
@@ -341,9 +526,9 @@ public final class YsmCpuRenderPath {
         if (posIdx * 3 + 2 >= positions.length || normIdx * 3 + 2 >= normals.length
                 || uvIdx * 2 + 1 >= uvs.length || posIdx >= jointCounts.length
                 || posIdx >= jointIndices.length || posIdx >= weightIndices.length) {
-            // Corrupt index triple: drop only this vertex (the rest of the model
-            // keeps rendering; Epic Fight's CPU path would crash or draw garbage).
-            return;
+            // Corrupt index triple: keep this vertex slot so the rest of the model
+            // stays correctly indexed (EF's CPU path would crash).
+            emitDegenerateVertex(buf);
         }
 
         POS4.set(positions[posIdx * 3], positions[posIdx * 3 + 1], positions[posIdx * 3 + 2], 1.0F);
@@ -376,9 +561,9 @@ public final class YsmCpuRenderPath {
             totalWeight += weight;
         }
         if (totalWeight <= 0.0F) {
-            // No contributing joint (all weights zero): skip the vertex instead of
-            // writing it at the model origin (which renders as a visible spike).
-            return;
+            // No contributing joint (all weights zero): emit a degenerate vertex
+            // instead of writing it at the model origin (a visible spike).
+            emitDegenerateVertex(buf);
         }
 
         float px = ACC4.x;
@@ -424,8 +609,8 @@ public final class YsmCpuRenderPath {
         if (Float.isNaN(px) || Float.isNaN(py) || Float.isNaN(pz)
                 || Float.isNaN(nx) || Float.isNaN(ny) || Float.isNaN(nz)) {
             // A NaN part transform would make this whole part vanish on every
-            // render path; drop the vertex to keep the frame stable.
-            return;
+            // render path; emit a degenerate vertex to keep the frame stable.
+            emitDegenerateVertex(buf);
         }
 
         // Apply the poseStack on the CPU (same contract as Epic Fight's drawPosed:
@@ -458,18 +643,39 @@ public final class YsmCpuRenderPath {
         buf.putInt(packNormal(nx, ny, nz));
     }
 
-    /** Pack a normal into the GL_INT_2_10_10_10_REV layout (same unpack as cpu_skin.vsh). */
-    static int packNormal(float x, float y, float z) {
-        float len = (float) Math.sqrt(x * x + y * y + z * z);
-        if (len > 1e-6f) {
-            x /= len;
-            y /= len;
-            z /= len;
+    private static final byte[] DEGENERATE_SCRATCH = new byte[YsmCpuMesh.VERTEX_STRIDE];
+
+    /**
+     * Emit a vertex that rasterizes nothing, keeping the stream aligned with the
+     * index triplets.
+     *
+     * Dropping a vertex instead shifts every later vertex of the part, so the
+     * remaining triangles of that part read the wrong corners - the comment
+     * "drop only this vertex, the rest keeps rendering" only holds for whole-part
+     * drops. Repeating the previous vertex collapses the affected triangle to
+     * zero area, which is exactly "this triangle is not drawn" without the
+     * mis-indexing.
+     */
+    private static void emitDegenerateVertex(ByteBuffer buf) {
+        int pos = buf.position();
+        if (pos >= YsmCpuMesh.VERTEX_STRIDE) {
+            int base = pos - YsmCpuMesh.VERTEX_STRIDE;
+            for (int i = 0; i < YsmCpuMesh.VERTEX_STRIDE; i++) {
+                DEGENERATE_SCRATCH[i] = buf.get(base + i);
+            }
+            buf.put(DEGENERATE_SCRATCH);
+        } else {
+            // no previous vertex (corrupt first vertex): a zero vertex keeps the
+            // stream aligned and is off-screen for a camera-space position
+            for (int i = 0; i < YsmCpuMesh.VERTEX_STRIDE; i++) {
+                buf.put((byte) 0);
+            }
         }
-        int xi = Math.max(-511, Math.min(511, Math.round(x * 511)));
-        int yi = Math.max(-511, Math.min(511, Math.round(y * 511)));
-        int zi = Math.max(-511, Math.min(511, Math.round(z * 511)));
-        return (xi & 0x3FF) | ((yi & 0x3FF) << 10) | ((zi & 0x3FF) << 20);
+    }
+
+    /** Pack a normal into the GL_INT_2_10_10_10_REV layout (single shared implementation). */
+    static int packNormal(float x, float y, float z) {
+        return com.ysmef.geomodel.renderer.GlRenderState.packNormal(x, y, z);
     }
 
     /**
@@ -486,16 +692,17 @@ public final class YsmCpuRenderPath {
         RenderSystem.getModelViewMatrix().get(mvScratch);
         RenderSystem.getInverseViewRotationMatrix().get(ivrScratch);
 
-        // Save the GL state this path overrides and restore it after the draw
-        // (see the restore block at the end). Without the restore the residue
-        // (cull disabled, blend disabled, ...) leaks into whatever renders
-        // next - visible as GUI corruption (red rectangles) when nothing after
-        // the mesh draw re-establishes the state (e.g. empty-handed maids,
-        // where no held-item layer follows the mesh draw).
-        boolean cullEnabled = GL11.glIsEnabled(GL11.GL_CULL_FACE);
-        boolean blendEnabled = GL11.glIsEnabled(GL11.GL_BLEND);
-        boolean depthTestEnabled = GL11.glIsEnabled(GL11.GL_DEPTH_TEST);
-        boolean depthMaskEnabled = GL11.glGetBoolean(GL11.GL_DEPTH_WRITEMASK);
+        // Save the GL state this path overrides and restore it in the finally
+        // below. Without an exception-safe restore the residue (cull disabled,
+        // blend disabled, ...) leaks into whatever renders next - visible as GUI
+        // corruption (red rectangles) when nothing after the mesh draw
+        // re-establishes the state (e.g. empty-handed maids, where no held-item
+        // layer follows the mesh draw). Keeping it in the finally rather than on
+        // the straight-line path also covers a mid-draw failure: the caller then
+        // falls back to another draw, which must not inherit our half-applied
+        // state.
+        com.ysmef.geomodel.renderer.GlRenderState.Snapshot glState =
+                com.ysmef.geomodel.renderer.GlRenderState.capture();
 
         RenderSystem.disableCull();
         RenderSystem.enableDepthTest();
@@ -503,150 +710,147 @@ public final class YsmCpuRenderPath {
         RenderSystem.disableBlend();
 
         Minecraft mc = Minecraft.getInstance();
-        AbstractTexture modelTex = mc.getTextureManager().getTexture(texture);
-        int modelTexId = modelTex.getId();
+        boolean lightLayerOn = false;
+        try {
+            AbstractTexture modelTex = mc.getTextureManager().getTexture(texture);
+            if (modelTex == null) {
+                // uploaded-per-registry but absent from the texture manager: thrown
+                // inside the try so the finally restores the state changed above.
+                throw new IllegalStateException("texture not registered: " + texture);
+            }
+            int modelTexId = modelTex.getId();
 
-        GlStateManager._activeTexture(GL13.GL_TEXTURE0 + 2);
-        mc.gameRenderer.lightTexture().turnOnLightLayer();
+            GlStateManager._activeTexture(GL13.GL_TEXTURE0 + 2);
+            mc.gameRenderer.lightTexture().turnOnLightLayer();
+            lightLayerOn = true;
 
-        GlStateManager._activeTexture(GL13.GL_TEXTURE0 + 1);
-        mc.gameRenderer.overlayTexture().setupOverlayColor();
-        // the overlay texture has no getter; it is what setupOverlayColor bound to unit 1
-        GlStateManager._bindTexture(RenderSystem.getShaderTexture(1));
+            GlStateManager._activeTexture(GL13.GL_TEXTURE0 + 1);
+            mc.gameRenderer.overlayTexture().setupOverlayColor();
+            // the overlay texture has no getter; it is what setupOverlayColor bound to unit 1
+            GlStateManager._bindTexture(RenderSystem.getShaderTexture(1));
 
-        GlStateManager._activeTexture(GL13.GL_TEXTURE0);
-        GlStateManager._bindTexture(modelTexId);
+            GlStateManager._activeTexture(GL13.GL_TEXTURE0);
+            GlStateManager._bindTexture(modelTexId);
 
-        GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, cpu.vbo);
-        GL15.glBufferSubData(GL15.GL_ARRAY_BUFFER, 0L, cpu.cpuBuffer);
-        GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, 0);
+            GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, cpu.vbo);
+            // Orphaning: re-allocate the storage with no data pointer before the
+            // subdata. The GL server keeps the previous storage alive for draws
+            // still in flight (an earlier maid's draw of this shared VBO), while
+            // this maid's vertices go into fresh storage - otherwise the
+            // glBufferSubData can race the asynchronous draw on weak drivers and
+            // the first maid flickers with the second maid's vertices.
+            GL15.glBufferData(GL15.GL_ARRAY_BUFFER, (long) cpu.capacity * YsmCpuMesh.VERTEX_STRIDE,
+                    GL15.GL_STREAM_DRAW);
+            GL15.glBufferSubData(GL15.GL_ARRAY_BUFFER, 0L, cpu.cpuBuffer);
+            GlStateManager._glBindBuffer(GL15.GL_ARRAY_BUFFER, 0);
 
-        float fogStart = RenderSystem.getShaderFogStart();
-        float fogEnd = RenderSystem.getShaderFogEnd();
-        float[] fogColor = RenderSystem.getShaderFogColor();
-        int fogShape = RenderSystem.getShaderFogShape().getIndex();
+            float fogStart = RenderSystem.getShaderFogStart();
+            float fogEnd = RenderSystem.getShaderFogEnd();
+            float[] fogColor = RenderSystem.getShaderFogColor();
+            int fogShape = RenderSystem.getShaderFogShape().getIndex();
 
-        GlStateManager._glUseProgram(YsmCpuSkinShader.program());
-        if (YsmCpuSkinShader.locProj() >= 0) {
-            GL20.glUniformMatrix4fv(YsmCpuSkinShader.locProj(), false, projScratch);
-        }
-        if (YsmCpuSkinShader.locMv() >= 0) {
-            GL20.glUniformMatrix4fv(YsmCpuSkinShader.locMv(), false, mvScratch);
-        }
-        if (YsmCpuSkinShader.locIvr() >= 0) {
-            GL20.glUniformMatrix3fv(YsmCpuSkinShader.locIvr(), false, ivrScratch);
-        }
-        if (YsmCpuSkinShader.locColor() >= 0) {
-            GL20.glUniform4f(YsmCpuSkinShader.locColor(), r, g, b, a);
-        }
-        if (YsmCpuSkinShader.locOverlay() >= 0) {
-            GL20.glUniform1i(YsmCpuSkinShader.locOverlay(), overlay);
-        }
-        if (YsmCpuSkinShader.locFogStart() >= 0) {
-            GL20.glUniform1f(YsmCpuSkinShader.locFogStart(), fogStart);
-        }
-        if (YsmCpuSkinShader.locFogEnd() >= 0) {
-            GL20.glUniform1f(YsmCpuSkinShader.locFogEnd(), fogEnd);
-        }
-        if (YsmCpuSkinShader.locFogColor() >= 0) {
-            GL20.glUniform4f(YsmCpuSkinShader.locFogColor(), fogColor[0], fogColor[1], fogColor[2], fogColor[3]);
-        }
-        if (YsmCpuSkinShader.locFogShape() >= 0) {
-            GL20.glUniform1i(YsmCpuSkinShader.locFogShape(), fogShape);
-        }
-        refreshLights();
-        if (YsmCpuSkinShader.locLight0() >= 0) {
-            GL20.glUniform3f(YsmCpuSkinShader.locLight0(), currentLights[0].x, currentLights[0].y, currentLights[0].z);
-        }
-        if (YsmCpuSkinShader.locLight1() >= 0) {
-            GL20.glUniform3f(YsmCpuSkinShader.locLight1(), currentLights[1].x, currentLights[1].y, currentLights[1].z);
-        }
-        if (YsmCpuSkinShader.locPackedLight() >= 0) {
-            GL20.glUniform1i(YsmCpuSkinShader.locPackedLight(), packedLight);
-        }
+            GlStateManager._glUseProgram(YsmCpuSkinShader.program());
+            if (YsmCpuSkinShader.locProj() >= 0) {
+                GL20.glUniformMatrix4fv(YsmCpuSkinShader.locProj(), false, projScratch);
+            }
+            if (YsmCpuSkinShader.locMv() >= 0) {
+                GL20.glUniformMatrix4fv(YsmCpuSkinShader.locMv(), false, mvScratch);
+            }
+            if (YsmCpuSkinShader.locIvr() >= 0) {
+                GL20.glUniformMatrix3fv(YsmCpuSkinShader.locIvr(), false, ivrScratch);
+            }
+            if (YsmCpuSkinShader.locColor() >= 0) {
+                GL20.glUniform4f(YsmCpuSkinShader.locColor(), r, g, b, a);
+            }
+            if (YsmCpuSkinShader.locOverlay() >= 0) {
+                GL20.glUniform1i(YsmCpuSkinShader.locOverlay(), overlay);
+            }
+            if (YsmCpuSkinShader.locFogStart() >= 0) {
+                GL20.glUniform1f(YsmCpuSkinShader.locFogStart(), fogStart);
+            }
+            if (YsmCpuSkinShader.locFogEnd() >= 0) {
+                GL20.glUniform1f(YsmCpuSkinShader.locFogEnd(), fogEnd);
+            }
+            if (YsmCpuSkinShader.locFogColor() >= 0) {
+                GL20.glUniform4f(YsmCpuSkinShader.locFogColor(), fogColor[0], fogColor[1], fogColor[2], fogColor[3]);
+            }
+            if (YsmCpuSkinShader.locFogShape() >= 0) {
+                GL20.glUniform1i(YsmCpuSkinShader.locFogShape(), fogShape);
+            }
+            refreshLights();
+            if (YsmCpuSkinShader.locLight0() >= 0) {
+                GL20.glUniform3f(YsmCpuSkinShader.locLight0(), currentLights[0].x, currentLights[0].y, currentLights[0].z);
+            }
+            if (YsmCpuSkinShader.locLight1() >= 0) {
+                GL20.glUniform3f(YsmCpuSkinShader.locLight1(), currentLights[1].x, currentLights[1].y, currentLights[1].z);
+            }
+            if (YsmCpuSkinShader.locPackedLight() >= 0) {
+                GL20.glUniform1i(YsmCpuSkinShader.locPackedLight(), packedLight);
+            }
 
-        GlStateManager._glBindVertexArray(cpu.vao);
-        boolean translucent = YSMMeshLibrary.isTranslucentTexture(texture);
-        if (YsmCpuSkinShader.locAlphaMode() >= 0) {
-            GL20.glUniform1i(YsmCpuSkinShader.locAlphaMode(), 1);
-        }
-        GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, writtenCount);
-
-        if (translucent) {
-            RenderSystem.enableBlend();
-            RenderSystem.defaultBlendFunc();
+            GlStateManager._glBindVertexArray(cpu.vao);
+            boolean translucent = YSMMeshLibrary.isTranslucentTexture(texture);
             if (YsmCpuSkinShader.locAlphaMode() >= 0) {
-                GL20.glUniform1i(YsmCpuSkinShader.locAlphaMode(), 2);
+                GL20.glUniform1i(YsmCpuSkinShader.locAlphaMode(), 1);
             }
             GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, writtenCount);
-            RenderSystem.disableBlend();
-        }
 
-        GlStateManager._glUseProgram(0);
-        BufferUploader.invalidate();
-        GlStateManager._glBindVertexArray(0);
-
-        mc.gameRenderer.lightTexture().turnOffLightLayer();
-
-        // Restore the state saved before the draw (see the save block above).
-        if (cullEnabled) {
-            RenderSystem.enableCull();
-        } else {
-            RenderSystem.disableCull();
+            if (translucent) {
+                RenderSystem.enableBlend();
+                RenderSystem.defaultBlendFunc();
+                // vanilla translucent semantics: the blended pass must not write
+                // depth (otherwise it occludes entities behind it)
+                RenderSystem.depthMask(false);
+                if (YsmCpuSkinShader.locAlphaMode() >= 0) {
+                    GL20.glUniform1i(YsmCpuSkinShader.locAlphaMode(), 2);
+                }
+                GL11.glDrawArrays(GL11.GL_TRIANGLES, 0, writtenCount);
+                RenderSystem.depthMask(true);
+                RenderSystem.disableBlend();
+            }
+        } finally {
+            // Every cleanup is individually guarded: one failing call must not
+            // skip the rest of the restore.
+            try {
+                GlStateManager._glUseProgram(0);
+            } catch (Throwable ignored) {
+            }
+            try {
+                BufferUploader.invalidate();
+            } catch (Throwable ignored) {
+            }
+            try {
+                GlStateManager._glBindVertexArray(0);
+            } catch (Throwable ignored) {
+            }
+            try {
+                com.ysmef.geomodel.renderer.GlRenderState.restore(glState);
+            } catch (Throwable ignored) {
+            }
+            if (lightLayerOn) {
+                try {
+                    mc.gameRenderer.lightTexture().turnOffLightLayer();
+                } catch (Throwable ignored) {
+                }
+            }
         }
-        if (blendEnabled) {
-            RenderSystem.enableBlend();
-        } else {
-            RenderSystem.disableBlend();
-        }
-        if (depthTestEnabled) {
-            RenderSystem.enableDepthTest();
-        } else {
-            RenderSystem.disableDepthTest();
-        }
-        RenderSystem.depthMask(depthMaskEnabled);
     }
 
     // ------------------------------------------------------------------
-    // Gates mirrored from the main project's GPU render path
+    // Gates shared with the GPU render path
     // ------------------------------------------------------------------
-
-    /** Oculus/Iris API (reflective: the compat mod has no hard dependency on Oculus). */
-    private static final Class<?> IRIS_API_CLASS = findIrisApiClass();
-    private static long shaderPackCheckedAtNanos = 0;
-    private static boolean shaderPackInUseCache = false;
-
-    private static Class<?> findIrisApiClass() {
-        try {
-            return Class.forName("net.irisshaders.iris.api.v0.IrisApi");
-        } catch (Throwable t) {
-            return null;
-        }
-    }
 
     /**
      * Whether a shader pack is active (Oculus/Iris). Under a shader pack the
-     * custom GLSL program would bypass the pack's shaders, so the draw falls
-     * back to Epic Fight's own CPU path. Reflective + TTL-cached.
+     * custom GLSL program would bypass the pack's shaders, so the draw falls back
+     * to Epic Fight's own CPU path.
+     *
+     * Delegates to the GPU path's single implementation: this class used to carry
+     * a verbatim copy with its own independent TTL cache, so the two could
+     * disagree within one frame (and ~37 lines were duplicated).
      */
     private static boolean shaderPackInUse() {
-        long now = System.nanoTime();
-        if (now - shaderPackCheckedAtNanos < 250_000_000L) {
-            return shaderPackInUseCache;
-        }
-        shaderPackCheckedAtNanos = now;
-        boolean inUse = false;
-        if (IRIS_API_CLASS != null) {
-            try {
-                Object instance = IRIS_API_CLASS.getMethod("getInstance").invoke(null);
-                if (instance != null) {
-                    inUse = Boolean.TRUE.equals(IRIS_API_CLASS.getMethod("isShaderPackInUse").invoke(instance));
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        shaderPackInUseCache = inUse;
-        return inUse;
+        return com.ysmef.geomodel.gpu.YsmGpuRenderPath.shaderPackInUse();
     }
 
     private static void refreshLights() {
@@ -772,6 +976,9 @@ public final class YsmCpuRenderPath {
             cpu.dispose();
         }
         UNSUPPORTED.remove(mesh);
+        // identity-keyed diagnostic state must not outlive the mesh
+        CPU_SKIP_DIAG.remove(mesh);
+        CPU_ACTIVE_LOGGED.remove(mesh);
     }
 
     /** Free every CPU-path mesh and per-armature cache (resource reload). Must run on the render thread. */
@@ -786,6 +993,8 @@ public final class YsmCpuRenderPath {
             CPU_MESHES.clear();
         }
         UNSUPPORTED.clear();
+        CPU_SKIP_DIAG.clear();
+        CPU_ACTIVE_LOGGED.clear();
         synchronized (TO_ORIGIN_CACHE) {
             TO_ORIGIN_CACHE.clear();
             POSE_LENGTH_CACHE.clear();

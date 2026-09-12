@@ -65,6 +65,11 @@ mixin {
     add sourceSets.main, "${mod_id}.refmap.json"
     config "${mod_id}.mixins.json"
     config "${mod_id}.eftlm.mixins.json"
+    // Optional YSM-class guard, kept in its own required:false config because it
+    // targets YSM classes by name while this mod has no YSM dependency. That
+    // config also carries YsmGeoMixinPlugin, which disables the guard when
+    // YSM_EpicFight_Compat is installed (that mod applies the identical guard).
+    config "${mod_id}.ysm.mixins.json"
 }
 
 sourceSets.main.resources { srcDir 'src/generated/resources' }
@@ -96,6 +101,18 @@ dependencies {
     // Touhou Little Maid + EpicFight_TouhouLittleMaid (optional maid compat)
     implementation fg.deobf("libs:touhoulittlemaid:${tlm_version}")
     implementation fg.deobf("libs:ef_tlm:${eftlm_version}")
+
+    // Unit tests over the pure-Java parts (molang evaluator, id/path sanitizing,
+    // joint table, bone-name normalization). No Minecraft runtime is started.
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+    }
 }
 
 jar.finalizedBy('reobfJar')

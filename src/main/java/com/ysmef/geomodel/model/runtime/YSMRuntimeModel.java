@@ -67,19 +67,28 @@ public final class YSMRuntimeModel {
     private final Map<UUID, YSMPlayerAnimator> animators = new ConcurrentHashMap<>();
 
     /**
-     * Last tick each animator was used (entity.tickCount), used to sweep
-     * animators of entities that left the world / stopped being rendered, so a
-     * big model's per-player evaluator state (hundreds of KB for large models)
-     * does not accumulate for every player that ever used it.
+     * Last sweep-clock stamp each animator was used at, used to drop animators of
+     * entities that left the world / stopped being rendered, so a big model's
+     * per-player evaluator state (hundreds of KB for large models) does not
+     * accumulate for every entity that ever used it.
+     *
+     * The stamp is the level's game time ({@link #sweepClockOf}), NOT
+     * {@code entity.tickCount}: tickCount is per-entity (starts at 0 on spawn and
+     * resets on respawn / dimension change), so subtracting stamps taken from
+     * different entities compared unrelated clocks and deleted the still-live
+     * animators of every entity younger than the sweep trigger - once every 15 s
+     * per model, for every maid spawned after the sweeping one.
      */
-    private final Map<UUID, Integer> animatorLastTick = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> animatorLastTick = new ConcurrentHashMap<>();
 
     /** Sweep cadence: scan at most every 15 s. */
-    private static final int ANIMATOR_SWEEP_INTERVAL_TICKS = 300;
+    private static final long ANIMATOR_SWEEP_INTERVAL_TICKS = 300;
     /** Drop animators unused for more than 60 s. */
-    private static final int ANIMATOR_TTL_TICKS = 1200;
-    private static volatile int lastSweepTick = -1;
+    private static final long ANIMATOR_TTL_TICKS = 1200;
+    private static volatile long lastSweepTick = -1;
     private static final java.util.concurrent.atomic.AtomicBoolean SWEEP_IN_PROGRESS = new java.util.concurrent.atomic.AtomicBoolean(false);
+    /** Fallback sweep clock for entities without a level (unload edge): monotonic, never 0. */
+    private static final java.util.concurrent.atomic.AtomicLong FALLBACK_TICK = new java.util.concurrent.atomic.AtomicLong(1);
 
     private YSMRuntimeModel(String modelId, BoneRt[] bones, Map<String, Integer> boneIndex,
                             List<CompiledAnim> parallels, Map<String, CompiledAnim> states,
@@ -97,7 +106,7 @@ public final class YSMRuntimeModel {
 
     public YSMPlayerAnimator animatorFor(LivingEntity entity) {
         UUID uuid = entity.getUUID();
-        int tick = entity.tickCount;
+        long tick = sweepClockOf(entity);
         animatorLastTick.put(uuid, tick);
         YSMPlayerAnimator animator = animators.get(uuid);
         if (animator == null) {
@@ -108,9 +117,21 @@ public final class YSMRuntimeModel {
         return animator;
     }
 
-    /** Periodically drop stale per-player animators (see {@link #ANIMATOR_TTL_TICKS}). */
-    private static void sweepIfDue(int tick) {
-        int last = lastSweepTick;
+    /**
+     * Global monotonic sweep clock: the entity's level game time, which is the
+     * same for every entity rendered in a frame (the client only renders the
+     * current dimension). Per-entity {@code tickCount} values are not comparable
+     * across entities. A level-less entity (unloaded mid-frame) falls back to a
+     * monotonic local counter so its stamp is never mistaken for the epoch.
+     */
+    private static long sweepClockOf(LivingEntity entity) {
+        net.minecraft.world.level.Level level = entity.level();
+        return level != null ? level.getGameTime() : FALLBACK_TICK.incrementAndGet();
+    }
+
+    /** Periodically drop stale per-entity animators (see {@link #ANIMATOR_TTL_TICKS}). */
+    private static void sweepIfDue(long tick) {
+        long last = lastSweepTick;
         if (tick - last < ANIMATOR_SWEEP_INTERVAL_TICKS) {
             return;
         }
@@ -131,10 +152,10 @@ public final class YSMRuntimeModel {
         }
     }
 
-    private void sweepAnimators(int nowTick) {
-        java.util.Iterator<Map.Entry<UUID, Integer>> it = animatorLastTick.entrySet().iterator();
+    private void sweepAnimators(long nowTick) {
+        java.util.Iterator<Map.Entry<UUID, Long>> it = animatorLastTick.entrySet().iterator();
         while (it.hasNext()) {
-            Map.Entry<UUID, Integer> entry = it.next();
+            Map.Entry<UUID, Long> entry = it.next();
             if (nowTick - entry.getValue() > ANIMATOR_TTL_TICKS) {
                 it.remove();
                 animators.remove(entry.getKey());
@@ -169,11 +190,36 @@ public final class YSMRuntimeModel {
     private volatile boolean[] defaultHidden;
 
     /**
+     * The bone parts of one mesh with their runtime bone index resolved once (see
+     * {@link #ensureDefaultPartMap}). The previous per-frame version did a
+     * {@code substring} plus a HashMap lookup for every part of every drawn mesh
+     * and allocated a String each time - hundreds of parts, every frame.
+     */
+    private YSMMesh defaultPartMapMesh;
+    private List<MeshPart> defaultBoneParts;
+    private int[] defaultPartBoneIdx;
+
+    /**
      * Apply the default-form visibility to every per-bone part of the mesh.
      * Used in Epic Fight battle mode, where no script animation may run.
      */
     public void applyDefaultVisibility(YSMMesh mesh) {
         boolean[] hidden = defaultHidden();
+        ensureDefaultPartMap(mesh);
+        for (int i = 0; i < defaultBoneParts.size(); i++) {
+            int boneIdx = defaultPartBoneIdx[i];
+            // -1 = the part's bone is not in the runtime bone table: keep it
+            // visible (same semantics as before, minus the per-frame work).
+            defaultBoneParts.get(i).setHidden(boneIdx >= 0 && boneIdx < hidden.length && hidden[boneIdx]);
+        }
+    }
+
+    private void ensureDefaultPartMap(YSMMesh mesh) {
+        if (defaultBoneParts != null && defaultPartMapMesh == mesh) {
+            return;
+        }
+        List<MeshPart> parts = new ArrayList<>();
+        List<Integer> idxs = new ArrayList<>();
         for (Map.Entry<String, MeshPart> entry : mesh.getPartEntrySetSafe()) {
             String partName = entry.getKey();
             if (!partName.startsWith(EFMeshJsonWriter.BONE_PART_PREFIX)) {
@@ -181,8 +227,15 @@ public final class YSMRuntimeModel {
             }
             String boneName = partName.substring(EFMeshJsonWriter.BONE_PART_PREFIX.length());
             Integer boneIdx = boneIndex.get(boneName);
-            entry.getValue().setHidden(boneIdx != null && boneIdx < hidden.length && hidden[boneIdx]);
+            parts.add(entry.getValue());
+            idxs.add(boneIdx != null ? boneIdx : -1);
         }
+        defaultBoneParts = parts;
+        defaultPartBoneIdx = new int[idxs.size()];
+        for (int i = 0; i < idxs.size(); i++) {
+            defaultPartBoneIdx[i] = idxs.get(i);
+        }
+        defaultPartMapMesh = mesh;
     }
 
     private boolean[] defaultHidden() {
@@ -191,13 +244,50 @@ public final class YSMRuntimeModel {
             synchronized (this) {
                 result = defaultHidden;
                 if (result == null) {
-                    result = computeDefaultHidden();
+                    try {
+                        result = computeDefaultHidden();
+                    } catch (Throwable t) {
+                        // A malformed runtime bone table must not kill the render
+                        // thread (this runs lazily from the mesh draw): fall back
+                        // to "nothing hidden" and log once per model.
+                        YSMGeoCompat.LOGGER.warn(
+                                "YSM-GEO Compat: default-form visibility failed for model '{}'; "
+                                        + "showing the full model", modelId, t);
+                        result = new boolean[bones.length];
+                    }
                     defaultHidden = result;
                 }
             }
         }
         return result;
     }
+
+    /**
+     * The names of the bones hidden in the model's default (battle-mode) form.
+     *
+     * Used by the bind armature's pivot computation: a hidden part never renders,
+     * so its bind geometry must not be allowed to define a segment pivot (a
+     * shipgirl's hidden rigging sits forward of the chest and would otherwise
+     * become the "neck"; a hidden alternate-form variant carries geometry at a
+     * completely different position).
+     *
+     * Returns raw (case-preserving) bone names, matching {@code bone.name} in the
+     * runtime table - callers compare against that field, not against a
+     * normalized form.
+     */
+    public Set<String> defaultHiddenBoneNames() {
+        boolean[] hidden = defaultHidden();
+        Set<String> out = new HashSet<>();
+        for (int i = 0; i < bones.length && i < hidden.length; i++) {
+            if (hidden[i]) {
+                out.add(bones[i].name);
+            }
+        }
+        return out;
+    }
+
+    /** Runtime bone hierarchies beyond this depth are treated as corrupt (cycle defense). */
+    private static final int MAX_BONE_DEPTH = 512;
 
     private boolean[] computeDefaultHidden() {
         int n = bones.length;
@@ -224,21 +314,27 @@ public final class YSMRuntimeModel {
         boolean[] done = new boolean[n];
         float[] eff = new float[n];
         for (int i = 0; i < n; i++) {
-            hidden[i] = effectiveScale(i, scales, done, eff) < HIDE_SCALE_EPSILON;
+            hidden[i] = effectiveScale(i, scales, done, eff, 0) < HIDE_SCALE_EPSILON;
         }
         return hidden;
     }
 
-    private float effectiveScale(int boneIdx, float[][] scales, boolean[] done, float[] eff) {
+    private float effectiveScale(int boneIdx, float[][] scales, boolean[] done, float[] eff, int depth) {
         if (done[boneIdx]) {
             return eff[boneIdx];
+        }
+        if (depth > MAX_BONE_DEPTH) {
+            // Cyclic or absurdly deep parent chain in the runtime JSON (a
+            // third-party generated file): without this the recursion would run
+            // until the stack dies, at compile time AND every frame.
+            throw new IllegalStateException("cyclic or too-deep bone hierarchy in runtime model");
         }
         float own = 1.0f;
         if (scales[boneIdx] != null) {
             own = Math.min(scales[boneIdx][0], Math.min(scales[boneIdx][1], scales[boneIdx][2]));
         }
         float parent = bones[boneIdx].parent >= 0
-                ? effectiveScale(bones[boneIdx].parent, scales, done, eff)
+                ? effectiveScale(bones[boneIdx].parent, scales, done, eff, depth + 1)
                 : 1.0f;
         eff[boneIdx] = parent * own;
         done[boneIdx] = true;
@@ -300,8 +396,67 @@ public final class YSMRuntimeModel {
             }
 
             @Override
-            public double callFunction(String name, double[] args) {
-                return 0.0;
+            public double callFunction(String name, double[] args, int argCount) {
+                // Returning 0 for EVERY function collapsed any math.*-driven scale
+                // channel in the default (battle-mode) form, which showed up as
+                // geometry that is present in the model silently disappearing -
+                // e.g. eye plates driven by a blink expression. Evaluate the same
+                // math.* set the per-frame evaluator handles, with the same
+                // argument-count guards (the buffer is reused, so slots past
+                // argCount hold values from an earlier call).
+                switch (name) {
+                    case "math.sin":
+                        return argCount < 1 ? 0.0 : Math.sin(Math.toRadians(args[0]));
+                    case "math.cos":
+                        return argCount < 1 ? 0.0 : Math.cos(Math.toRadians(args[0]));
+                    case "math.tan":
+                        return argCount < 1 ? 0.0 : Math.tan(Math.toRadians(args[0]));
+                    case "math.asin":
+                        return argCount < 1 ? 0.0 : Math.toDegrees(Math.asin(args[0]));
+                    case "math.acos":
+                        return argCount < 1 ? 0.0 : Math.toDegrees(Math.acos(args[0]));
+                    case "math.atan":
+                        return argCount < 1 ? 0.0 : Math.toDegrees(Math.atan(args[0]));
+                    case "math.atan2":
+                        return argCount < 2 ? 0.0 : Math.toDegrees(Math.atan2(args[0], args[1]));
+                    case "math.abs":
+                        return argCount < 1 ? 0.0 : Math.abs(args[0]);
+                    case "math.floor":
+                        return argCount < 1 ? 0.0 : Math.floor(args[0]);
+                    case "math.ceil":
+                        return argCount < 1 ? 0.0 : Math.ceil(args[0]);
+                    case "math.round":
+                        return argCount < 1 ? 0.0 : Math.round(args[0]);
+                    case "math.trunc":
+                        return argCount < 1 ? 0.0 : (long) (args[0] >= 0 ? Math.floor(args[0]) : Math.ceil(args[0]));
+                    case "math.sqrt":
+                        return argCount < 1 ? 0.0 : args[0] < 0 ? 0 : Math.sqrt(args[0]);
+                    case "math.pow":
+                        return argCount < 2 ? 0.0 : Math.pow(args[0], args[1]);
+                    case "math.exp":
+                        return argCount < 1 ? 0.0 : Math.exp(args[0]);
+                    case "math.ln":
+                    case "math.log":
+                        return argCount < 1 ? 0.0 : args[0] <= 0 ? 0 : Math.log(args[0]);
+                    case "math.lerp":
+                        return argCount < 3 ? 0.0 : args[0] + (args[1] - args[0]) * args[2];
+                    case "math.min":
+                        return argCount < 1 ? 0.0 : argCount < 2 ? args[0] : Math.min(args[0], args[1]);
+                    case "math.max":
+                        return argCount < 1 ? 0.0 : argCount < 2 ? args[0] : Math.max(args[0], args[1]);
+                    case "math.clamp":
+                        return argCount < 3 ? 0.0 : Math.max(args[1], Math.min(args[2], args[0]));
+                    case "math.mod":
+                        return argCount < 2 ? 0.0 : args[1] == 0 ? 0 : args[0] % args[1];
+                    case "math.sign":
+                        return argCount < 1 ? 0.0 : Math.signum(args[0]);
+                    case "math.pi":
+                        return Math.PI;
+                    default:
+                        // random / query.* / anything state-dependent stays neutral
+                        // in the frozen default-form environment
+                        return 0.0;
+                }
             }
 
             @Override
@@ -372,6 +527,9 @@ public final class YSMRuntimeModel {
                 return;
             }
         }
+        if (isRetryBlocked(modelId)) {
+            return;
+        }
         if (!PRELOADING.add(modelId)) {
             return;
         }
@@ -380,12 +538,44 @@ public final class YSMRuntimeModel {
             YSMRuntimeModel model = loadAndCompile(modelId);
             if (PRELOADING.remove(modelId) && generation == RELOAD_GENERATION.get()) {
                 synchronized (CACHE) {
-                    CACHE.put(modelId, model);
+                    if (model != null) {
+                        CACHE.put(modelId, model);
+                        FAILED_UNTIL.remove(modelId);
+                    }
                 }
             }
         } catch (Throwable t) {
+            // Was completely silent: a preload that died from an Error (SOE, OOM)
+            // left the model uncached with no trace at all.
             PRELOADING.remove(modelId);
+            if (FAILED_UNTIL.put(modelId, System.nanoTime() + LOAD_FAILURE_BACKOFF_NANOS) == null) {
+                YSMGeoCompat.LOGGER.warn(
+                        "YSM-GEO Compat: preload of runtime model '{}' failed, retrying in {}s",
+                        modelId, LOAD_FAILURE_BACKOFF_NANOS / 1_000_000_000L, t);
+            }
         }
+    }
+
+    /**
+     * Retry backoff for runtime models that failed to load. A failed compile must
+     * NOT be cached as null: {@code CACHE.put(modelId, null)} makes
+     * {@code containsKey} true forever, so one transient failure (a mesh file
+     * still being written, a preload racing a reload) permanently disabled the
+     * model's scripts for the session - no variants, no animation.
+     */
+    private static final long LOAD_FAILURE_BACKOFF_NANOS = 10L * 1_000_000_000L;
+    private static final Map<String, Long> FAILED_UNTIL = new ConcurrentHashMap<>();
+
+    private static boolean isRetryBlocked(String modelId) {
+        Long until = FAILED_UNTIL.get(modelId);
+        if (until == null) {
+            return false;
+        }
+        if (System.nanoTime() < until) {
+            return true;
+        }
+        FAILED_UNTIL.remove(modelId);
+        return false;
     }
 
     private static YSMRuntimeModel loadAndCache(String modelId) {
@@ -394,7 +584,13 @@ public final class YSMRuntimeModel {
                 return CACHE.get(modelId);
             }
             YSMRuntimeModel model = loadAndCompile(modelId);
+            if (model == null) {
+                // never poison the cache with a null entry (see FAILED_UNTIL)
+                FAILED_UNTIL.put(modelId, System.nanoTime() + LOAD_FAILURE_BACKOFF_NANOS);
+                return null;
+            }
             CACHE.put(modelId, model);
+            FAILED_UNTIL.remove(modelId);
             return model;
         }
     }
@@ -416,6 +612,7 @@ public final class YSMRuntimeModel {
             CACHE.remove(modelId);
         }
         PRELOADING.remove(modelId);
+        FAILED_UNTIL.remove(modelId);
     }
 
     /** Forget all cached runtime models (called when meshes are regenerated). */

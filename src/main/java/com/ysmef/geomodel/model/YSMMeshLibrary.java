@@ -6,6 +6,7 @@ import com.ysmef.geomodel.model.runtime.YSMRuntimeModel;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.DynamicTexture;
 import net.minecraft.resources.ResourceLocation;
+import yesman.epicfight.api.client.model.Meshes;
 
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
@@ -16,9 +17,14 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import javax.imageio.ImageIO;
@@ -44,12 +50,24 @@ public final class YSMMeshLibrary {
     private static final Path PACK_ROOT = CONFIG_ROOT.resolve("resourcepack");
     private static final Path MESH_DIR = PACK_ROOT.resolve("assets").resolve(YSMGeoCompat.MODID).resolve("animmodels").resolve("entity");
     private static final Path RUNTIME_DIR = PACK_ROOT.resolve("assets").resolve(YSMGeoCompat.MODID).resolve("ysm_runtime").resolve("entity");
+    private static final Path TEXTURE_DIR = PACK_ROOT.resolve("assets").resolve(YSMGeoCompat.MODID).resolve("textures");
     private static final Path PACK_META = PACK_ROOT.resolve("pack.mcmeta");
 
     private static final String MESH_NAMESPACE = YSMGeoCompat.MODID;
 
-    /** textureRL string -> original encoded texture bytes (registered into the texture manager on demand) */
-    private static final Map<String, byte[]> TEXTURE_DATA = new LinkedHashMap<>();
+    /**
+     * textureRL string -> original encoded texture bytes, until the texture is
+     * uploaded (registered from the conversion path, drained on the render
+     * thread). Concurrent because the conversion runs off-thread.
+     */
+    private static final Map<String, byte[]> TEXTURE_DATA = new ConcurrentHashMap<>();
+
+    /**
+     * relative texture path -> content hash of the file already mirrored into the
+     * generated pack, so a reload that re-registers unchanged textures does not
+     * rewrite them (see writePackTexture).
+     */
+    private static final Map<String, Integer> PACK_TEXTURE_HASHES = new ConcurrentHashMap<>();
 
     /**
      * OpenYSM/ModernYSM ship the ImageStream decoders (WebP/AVIF) inside their
@@ -70,6 +88,105 @@ public final class YSMMeshLibrary {
     private static final Map<String, Boolean> TEXTURE_TRANSLUCENT = new ConcurrentHashMap<>();
 
     /**
+     * textureRL string -> how many models reference that texture. A texture can
+     * be shared (a model pack's extra_textures can point at another model's
+     * file), so eviction must only release it when the last referencing model
+     * goes away - otherwise a still-visible maid renders untextured.
+     */
+    private static final Map<String, Integer> TEXTURE_REFS = new ConcurrentHashMap<>();
+
+    /** modelId -> texture resource-location strings registered for it (eviction). */
+    private static final Map<String, Set<String>> MODEL_TEXTURES = new ConcurrentHashMap<>();
+
+    /**
+     * Textures whose decode finished on the background pool and whose GL upload
+     * is still pending. The DynamicTexture upload must run on the render thread,
+     * so the decoded image waits here for {@link #processPendingTextureUploads}.
+     */
+    private static final Queue<TextureUploadTask> COMPLETED_UPLOADS = new ConcurrentLinkedQueue<>();
+
+    /** textureRL strings currently being decoded on the background pool. */
+    private static final Set<String> PENDING_TEXTURE_DECODES = ConcurrentHashMap.newKeySet();
+
+    /** textureRL string -> ticks left before its GL texture is released. */
+    private static final Map<String, Integer> PENDING_TEXTURE_RELEASES = new ConcurrentHashMap<>();
+
+    /** Evicted meshes -> ticks left before their GL resources are destroyed. */
+    private static final Map<YSMMesh, Integer> PENDING_MESH_RELEASES = new ConcurrentHashMap<>();
+
+    /**
+     * Ticks an evicted mesh/texture is kept alive after eviction.
+     *
+     * The mesh instance is shared by every entity using the model and may still
+     * be drawn later in the current frame (shadow/outline/capture passes select
+     * meshes before the main pass draws them), and a texture may still be bound
+     * by a draw command already recorded. Destroying either immediately would
+     * use freed GL objects; by the time the delay elapses the mesh has been
+     * dropped from Epic Fight's cache and a fresh instance has taken over.
+     */
+    private static final int RELEASE_DELAY_TICKS = 5;
+
+    /**
+     * Wall-clock budget for the per-frame texture upload drain (ModernYSM's
+     * UploadManager uses the same idea). Uploads are GL calls and cannot be
+     * spread across threads; bounding the time keeps a burst of first-seen
+     * models from stalling one frame, at the cost of a few frames of
+     * missing-texture rendering.
+     */
+    private static final long TEXTURE_UPLOAD_BUDGET_NANOS = 10_000_000L;
+
+    /**
+     * LRU usage tracking in access order: every mesh lookup touches its model.
+     * When more models are loaded than the configured cap, the least recently
+     * used ones release their GL resources (see {@link #trimIfNeeded}).
+     */
+    private static final java.util.LinkedHashMap<String, Boolean> ACCESS_ORDER =
+            new java.util.LinkedHashMap<>(64, 0.75f, true);
+
+    /** Models whose mesh was actually instantiated, i.e. own GL resources. */
+    private static final Set<String> LOADED_MODELS = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Set when Epic Fight's private mesh cache cannot be reached: eviction is
+     * then disabled rather than performed partially. Dropping the entry from our
+     * own tables while Epic Fight still holds the mesh would leave a dead
+     * instance in a cache that keeps handing it out, and every later draw would
+     * use freed GL objects - far worse than the memory eviction saves.
+     */
+    private static volatile boolean EVICTION_DISABLED = false;
+
+    /** Whether the first eviction batch was already reported at info level. */
+    private static volatile boolean EVICTION_LOGGED = false;
+
+    /**
+     * Background image-decode pool. Decoding is pure CPU work; only the resulting
+     * GL upload has to happen on the render thread.
+     */
+    private static final ExecutorService DECODE_POOL = Executors.newFixedThreadPool(
+            Math.max(2, Math.min(4, Runtime.getRuntime().availableProcessors())), runnable -> {
+                Thread thread = new Thread(runnable, "ysm-geo-texture");
+                thread.setDaemon(true);
+                return thread;
+            });
+
+    /** One decoded texture waiting for its render-thread GL upload. */
+    private record TextureUploadTask(ResourceLocation location, NativeImage image, boolean translucent, int generation) {}
+
+    /**
+     * Incremented by {@link #invalidateAll()}: a decode that started before a
+     * resource reload must not upload its (now stale) image after it.
+     *
+     * Without this a texture whose decode was in flight when the reload dropped
+     * every upload state would re-register its old pixels and mark the location
+     * uploaded - and the freshly re-registered bytes of the new generation would
+     * then never be uploaded, so a changed texture file only applied after a
+     * restart. That is exactly the bug the invalidation exists to prevent, just
+     * through a narrower window.
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger TEXTURE_GENERATION =
+            new java.util.concurrent.atomic.AtomicInteger();
+
+    /**
      * Background pool for runtime-script preloads (compiling a runtime model
      * takes ~100ms for large models; doing it off the render thread keeps the
      * first draw of a model free of hitches).
@@ -82,6 +199,41 @@ public final class YSMMeshLibrary {
             });
 
     private YSMMeshLibrary() {}
+
+    /**
+     * Draw-path resource releasers, registered by the gpu/cpu packages on first
+     * class load. Keeps the model package from importing them (see
+     * {@link com.ysmef.geomodel.model.MeshReleaser}).
+     */
+    private static final List<MeshReleaser> RELEASERS = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    public static void registerMeshReleaser(MeshReleaser releaser) {
+        if (releaser != null) {
+            RELEASERS.add(releaser);
+        }
+    }
+
+    /** Free the draw-path resources of one mesh on every registered path. */
+    public static void disposeMesh(YSMMesh mesh) {
+        for (MeshReleaser releaser : RELEASERS) {
+            try {
+                releaser.disposeMesh(mesh);
+            } catch (Throwable t) {
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: mesh release failed", t);
+            }
+        }
+    }
+
+    /** Free every direct-draw resource (resource reload). */
+    public static void disposeAllPaths() {
+        for (MeshReleaser releaser : RELEASERS) {
+            try {
+                releaser.disposeAll();
+            } catch (Throwable t) {
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: render-path release failed", t);
+            }
+        }
+    }
 
     /**
      * The resource pack root that should be registered as a client resource pack.
@@ -103,7 +255,13 @@ public final class YSMMeshLibrary {
      * given mesh id, evaluated by YSMRuntimeModel at render time.
      */
     public static Path getRuntimeFile(String meshId) {
-        return RUNTIME_DIR.resolve(meshId + ".json");
+        // sanitize() guarantees a traversal-free relative path, so this resolve
+        // cannot escape RUNTIME_DIR; resolveInside re-checks it as a fence in
+        // front of the filesystem (the fallback is unreachable for sanitize
+        // output and exists only to keep the method total).
+        String name = sanitize(meshId);
+        Path resolved = resolveInside(RUNTIME_DIR, name + ".json");
+        return resolved != null ? resolved : RUNTIME_DIR.resolve(name + ".json");
     }
 
     /** modelId -> meshId (sanitized), for runtime lookup. */
@@ -113,26 +271,96 @@ public final class YSMMeshLibrary {
 
     /**
      * The mesh file name used for TLM model-pack meshes: "namespace__path"
-     * (mirrors the naming in TlmModelLibrary).
+     * (mirrors the naming in TlmModelLibrary). Both halves go through the same
+     * {@link #sanitize} the writer uses, so the lookup can never drift from the
+     * generated file name.
      */
     public static String tlmMeshIdOf(String modelId) {
         net.minecraft.resources.ResourceLocation rl = net.minecraft.resources.ResourceLocation.tryParse(modelId);
         if (rl == null) {
             return null;
         }
-        return tlmSanitize(rl.getNamespace()) + "__" + tlmSanitize(rl.getPath());
+        return sanitize(rl.getNamespace()) + "__" + sanitize(rl.getPath());
     }
 
-    private static String tlmSanitize(String value) {
-        StringBuilder sb = new StringBuilder();
-        for (char c : value.toLowerCase().toCharArray()) {
-            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '/' || c == '-') {
-                sb.append(c);
-            } else {
-                sb.append('_');
+    /**
+     * Drop every texture's registered bytes and upload state (resource reload).
+     *
+     * Without this the reload was a no-op for textures: {@code UPLOADED_TEXTURES}
+     * still contained the resource location, so {@code ensureTextureUploaded}
+     * returned immediately and the freshly re-registered bytes were never
+     * uploaded - a changed texture file only took effect after a game restart,
+     * and {@code TEXTURE_TRANSLUCENT} stayed stale too.
+     */
+    public static void invalidateAll() {
+        TEXTURE_DATA.clear();
+        UPLOADED_TEXTURES.clear();
+        TEXTURE_TRANSLUCENT.clear();
+        TEXTURE_REFS.clear();
+        MODEL_TEXTURES.clear();
+        PENDING_TEXTURE_DECODES.clear();
+        PENDING_TEXTURE_RELEASES.clear();
+        // Supersede any decode still running on the pool (see TEXTURE_GENERATION).
+        TEXTURE_GENERATION.incrementAndGet();
+        // Decoded but not yet uploaded images own native (off-heap) buffers: the
+        // dynamic textures of the previous generation are dropped by the reload
+        // and these images will never be registered, so they must be closed here
+        // or every reload leaks them.
+        for (TextureUploadTask task = COMPLETED_UPLOADS.poll(); task != null; task = COMPLETED_UPLOADS.poll()) {
+            closeQuietly(task.image());
+        }
+        // Delayed-released meshes are covered by disposeAllPaths() on the reload
+        // path; dropping the queue keeps them from being destroyed a second time.
+        PENDING_MESH_RELEASES.clear();
+        LOADED_MODELS.clear();
+        synchronized (ACCESS_ORDER) {
+            ACCESS_ORDER.clear();
+        }
+    }
+
+    /**
+     * Delete generated pack textures that no registered model refers to any more.
+     *
+     * Called once per mesh generation, after every model was converted and its
+     * textures registered. Without this the pack accumulates the textures of
+     * models that were removed from a pack, renamed, or registered under an
+     * earlier naming scheme - leftovers that are never read again but stay in the
+     * user's config folder forever.
+     *
+     * Does nothing when nothing was registered, so a failed generation can never
+     * wipe the folder.
+     */
+    public static void deleteStalePackTextures() {
+        if (MODEL_TEXTURES.isEmpty()) {
+            return;
+        }
+        Set<String> keep = new java.util.HashSet<>();
+        for (Set<String> textures : MODEL_TEXTURES.values()) {
+            for (String key : textures) {
+                ResourceLocation rl = ResourceLocation.tryParse(key);
+                if (rl != null && MESH_NAMESPACE.equals(rl.getNamespace())) {
+                    keep.add(rl.getPath());
+                }
             }
         }
-        return sb.toString();
+        if (keep.isEmpty()) {
+            return;
+        }
+        try (var stream = Files.walk(TEXTURE_DIR)) {
+            stream.filter(Files::isRegularFile).forEach(path -> {
+                String relative = TEXTURE_DIR.relativize(path).toString().replace('\\', '/');
+                if (!keep.contains("textures/" + relative)) {
+                    try {
+                        Files.deleteIfExists(path);
+                    } catch (IOException ignored) {
+                        // a file locked by another process stays; the next reload retries
+                    }
+                }
+            });
+        } catch (Exception e) {
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to clean the generated pack textures: {}",
+                    e.toString());
+        }
     }
 
     /**
@@ -143,6 +371,7 @@ public final class YSMMeshLibrary {
         try {
             Files.createDirectories(MESH_DIR);
             Files.createDirectories(RUNTIME_DIR);
+            Files.createDirectories(TEXTURE_DIR);
             if (!Files.exists(PACK_META)) {
                 Files.writeString(PACK_META, """
                         {
@@ -158,66 +387,336 @@ public final class YSMMeshLibrary {
         }
     }
 
-    private static String sanitize(String value) {
+    /**
+     * Rewrite an untrusted, model-supplied id into a relative path that cannot
+     * escape the directory it is resolved against.
+     *
+     * Model packs are third-party files. The previous version appended '.' and
+     * '/' verbatim, so a manifest declaring {@code "model_id": "x:../../../../evil"}
+     * produced an id that {@code Path.resolve} walked straight out of the
+     * generated pack - an arbitrary file read (model/texture/animation loads)
+     * and arbitrary write (generated mesh/runtime JSON) primitive.
+     *
+     * The rewrite therefore does three things:
+     * - folds characters outside the resource-location alphabet to '_' and
+     *   appends a hash suffix when anything was folded, so distinct ids stay
+     *   distinct (failures can never silently collide);
+     * - drops empty segments, which removes the leading/doubled-slash
+     *   (absolute-path) form;
+     * - replaces the traversal segments ".." and "." with "_".
+     *
+     * The result only ever contains {@code [a-z0-9/._-]} with non-empty,
+     * non-traversal segments, i.e. it is safe to resolve against any root.
+     */
+    public static String sanitize(String value) {
+        if (value == null) {
+            return "";
+        }
         StringBuilder sb = new StringBuilder();
-        boolean stripped = false;
+        boolean rewritten = false;
         for (char c : value.toLowerCase().toCharArray()) {
             if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '/' || c == '-') {
                 sb.append(c);
             } else {
                 sb.append('_');
-                stripped = true;
+                rewritten = true;
             }
         }
-        if (stripped) {
+        String[] segments = sb.toString().split("/");
+        sb.setLength(0);
+        for (String segment : segments) {
+            if (segment.isEmpty()) {
+                continue;
+            }
+            if (segment.equals("..") || segment.equals(".")) {
+                segment = "_";
+                rewritten = true;
+            }
+            if (sb.length() > 0) {
+                sb.append('/');
+            }
+            sb.append(segment);
+        }
+        if (rewritten) {
             sb.append('_').append(Integer.toHexString(value.hashCode()));
         }
         return sb.toString();
     }
 
     /**
+     * Resolve a model-supplied relative path against {@code root}, returning
+     * null unless the result stays inside {@code root}.
+     *
+     * Rejects absolute paths, drive-letter and UNC forms, backslashes, NUL and
+     * the "." / ".." segments, then re-checks the normalized result against the
+     * normalized root. This is the lexical fence that every filesystem access
+     * driven by a model pack must pass through; a symlink-based escape still
+     * needs a {@code toRealPath} check, but no model pack can reach one without
+     * passing this first.
+     */
+    public static Path resolveInside(Path root, String relative) {
+        if (root == null || relative == null || relative.isEmpty()) {
+            return null;
+        }
+        if (relative.indexOf('\0') >= 0 || relative.indexOf('\\') >= 0 || relative.startsWith("/")) {
+            return null;
+        }
+        if (relative.length() >= 2 && relative.charAt(1) == ':') {
+            return null;
+        }
+        for (String segment : relative.split("/")) {
+            if (segment.isEmpty() || segment.equals(".") || segment.equals("..")) {
+                return null;
+            }
+        }
+        Path base = root.toAbsolutePath().normalize();
+        Path resolved = base.resolve(relative).normalize();
+        return resolved.startsWith(base) ? resolved : null;
+    }
+
+    /**
      * Register raw texture bytes (PNG/JPEG) under our own resource location,
      * ready for on-demand upload to the texture manager (see
-     * ensureTextureUploaded).
+     * ensureTextureUploaded), and mirror them into the generated pack.
      *
-     * @param relativePath path inside our textures/ space (without .png)
+     * @param relativePath path inside our textures/ space (without .png); it is
+     *                     sanitized, so a traversal form cannot escape it
      * @param data         encoded image bytes
      * @return the resource location the bytes were registered under
      */
     public static ResourceLocation registerTextureBytes(String relativePath, byte[] data) {
+        String safePath = sanitize(relativePath);
+        // TLM's manifest already names the file with its extension (".../x.png"),
+        // so appending another one produced ".../x.png.png": a resource location
+        // whose path lies about the file it points at, and (with the pack mirror
+        // below) a second copy of every texture under a doubled extension.
+        if (safePath.length() > 4 && safePath.regionMatches(true, safePath.length() - 4, ".png", 0, 4)) {
+            safePath = safePath.substring(0, safePath.length() - 4);
+        }
         ResourceLocation rl = ResourceLocation.fromNamespaceAndPath(MESH_NAMESPACE,
-                "textures/" + relativePath + ".png");
+                "textures/" + safePath + ".png");
         TEXTURE_DATA.put(rl.toString(), data);
+        writePackTexture(safePath, data);
         return rl;
     }
 
     /**
-     * Upload the texture bytes to the texture manager if not done yet.
-     * Must be called on the render thread.
+     * Write the texture into the generated pack so the resource location we hand
+     * out actually resolves through the resource manager.
+     *
+     * Two consumers need this. Anything that loads a texture by resource
+     * location - vanilla model layers, Epic Fight's own texture handling, other
+     * mods - only finds it through the ResourceManager, and a DynamicTexture
+     * registered with the texture manager is invisible to that path (it throws
+     * FileNotFoundException, rendering the mesh with red/missing edges). And a
+     * pack on disk is the only way a user can inspect or replace the texture of
+     * a converted model.
+     *
+     * PNG/JPEG payloads are copied verbatim (the decoder sniffs the format by
+     * magic bytes); WebP/AVIF payloads go through YSM's ImageStream decoders and
+     * raw-RGBA payloads through {@link #readRawRgba}, both re-encoded to PNG -
+     * writing the encoded bytes of those formats verbatim would produce a file
+     * whose extension lies about its content.
+     *
+     * Runs off the render thread (registration happens during conversion), so
+     * the write never stalls a frame.
      */
-    public static void ensureTextureUploaded(ResourceLocation rl) {
-        if (rl == null || UPLOADED_TEXTURES.containsKey(rl.toString())) {
+    private static void writePackTexture(String safeRelativePath, byte[] data) {
+        if (safeRelativePath.isEmpty() || data == null || data.length == 0) {
             return;
         }
-        byte[] data = TEXTURE_DATA.get(rl.toString());
-        if (data == null) {
+        int hash = Arrays.hashCode(data);
+        Integer previous = PACK_TEXTURE_HASHES.get(safeRelativePath);
+        if (previous != null && previous == hash) {
+            // the same bytes were already written in this session; conversion is
+            // re-run on every config/pack reload, and rewriting 235 identical
+            // files each time would be pure disk churn
+            return;
+        }
+        Path file = resolveInside(TEXTURE_DIR, safeRelativePath + ".png");
+        if (file == null) {
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: refused to write pack texture outside the pack root: {}",
+                    safeRelativePath);
             return;
         }
         try {
-            NativeImage image = decodeTexture(rl, data);
-            if (image == null) {
-                UPLOADED_TEXTURES.put(rl.toString(), Boolean.TRUE);
+            Files.createDirectories(file.getParent());
+            if (isPng(data) || isJpeg(data)) {
+                Files.write(file, data);
+            } else {
+                NativeImage image = decodeTexture(safeRelativePath, data);
+                if (image == null) {
+                    return;
+                }
+                try {
+                    image.writeToFile(file);
+                } finally {
+                    image.close();
+                }
+            }
+            PACK_TEXTURE_HASHES.put(safeRelativePath, hash);
+        } catch (Throwable t) {
+            // A failed mirror is not fatal: ensureTextureUploaded still feeds the
+            // DynamicTexture from TEXTURE_DATA, so the model renders textured.
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to write pack texture {}: {}",
+                    safeRelativePath, t.toString());
+        }
+    }
+
+    /**
+     * Start uploading the texture bytes to the texture manager if not done yet.
+     *
+     * The decode runs on the background pool and the GL upload is drained on the
+     * render thread by {@link #processPendingTextureUploads}, so the first draw
+     * of a model does not block on a multi-megabyte PNG decode.
+     *
+     * Until the upload completes {@link #isTextureUploaded} stays false, which is
+     * exactly the contract the direct draw paths already check: they fall back to
+     * Epic Fight's own render path for those frames, which binds the texture
+     * through the resource manager (the generated pack file, see
+     * {@link #writePackTexture}). So the model is textured from the first frame;
+     * only the skinning path changes for a frame or two.
+     */
+    public static void ensureTextureUploaded(ResourceLocation rl) {
+        if (rl == null) {
+            return;
+        }
+        String key = rl.toString();
+        if (UPLOADED_TEXTURES.containsKey(key) || PENDING_TEXTURE_DECODES.contains(key)) {
+            return;
+        }
+        byte[] data = TEXTURE_DATA.get(key);
+        if (!PENDING_TEXTURE_DECODES.add(key)) {
+            return;
+        }
+        // a re-upload cancels any delayed release of the same location
+        PENDING_TEXTURE_RELEASES.remove(key);
+        int generation = TEXTURE_GENERATION.get();
+        DECODE_POOL.execute(() -> {
+            try {
+                byte[] bytes = data;
+                if (bytes == null) {
+                    // The bytes are gone if the texture was released by an eviction
+                    // (or uploaded in an earlier generation). The generated pack
+                    // file written at registration time is the durable copy, so
+                    // the texture is re-read and re-uploaded instead of leaving
+                    // the model on the fallback path for the rest of the session.
+                    bytes = readPackTextureBytes(rl);
+                }
+                if (bytes == null) {
+                    return;
+                }
+                NativeImage image = decodeTexture(key, bytes);
+                if (generation != TEXTURE_GENERATION.get()) {
+                    // A resource reload happened while this image was decoding: the
+                    // bytes belong to the previous generation, so the image is
+                    // dropped (and closed) instead of being uploaded over the new
+                    // one's registration.
+                    closeQuietly(image);
+                    return;
+                }
+                if (image == null) {
+                    UPLOADED_TEXTURES.put(key, Boolean.TRUE);
+                    TEXTURE_DATA.remove(key);
+                    return;
+                }
+                // The translucency scan runs here, on the decode worker: the
+                // per-frame upload drain has a small time budget and must not
+                // spend it scanning millions of pixels.
+                boolean translucent = hasTranslucentPixels(image);
+                COMPLETED_UPLOADS.add(new TextureUploadTask(rl, image, translucent, generation));
+                // Wake the render thread for the drain instead of waiting for the
+                // next frame - the texture is typically needed right now.
+                Minecraft.getInstance().execute(YSMMeshLibrary::processPendingTextureUploads);
+            } catch (Throwable t) {
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to decode texture {}", key, t);
+                UPLOADED_TEXTURES.put(key, Boolean.TRUE);
+                TEXTURE_DATA.remove(key);
+            } finally {
+                PENDING_TEXTURE_DECODES.remove(key);
+            }
+        });
+    }
+
+    /**
+     * Re-read a texture's bytes from the generated pack file.
+     *
+     * Registration mirrors every texture into the pack (see
+     * {@link #writePackTexture}), so the file is the durable copy of a texture
+     * whose in-memory bytes were dropped after upload or released by an eviction.
+     * Returns null when the pack has no such file (an unsupported format that
+     * could not be re-encoded, or a deleted pack), which leaves the caller - and
+     * the renderer - on the fallback path.
+     *
+     * Runs on the decode pool: no caller is on the render thread.
+     */
+    private static byte[] readPackTextureBytes(ResourceLocation rl) {
+        if (rl == null || !MESH_NAMESPACE.equals(rl.getNamespace())) {
+            return null;
+        }
+        try {
+            Path file = resolveInside(PACK_ROOT.resolve("assets").resolve(MESH_NAMESPACE), rl.getPath());
+            if (file == null || !Files.isRegularFile(file)) {
+                return null;
+            }
+            return Files.readAllBytes(file);
+        } catch (Throwable t) {
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to re-read texture {} from the pack: {}",
+                    rl, t.toString());
+            return null;
+        }
+    }
+
+    /**
+     * Drain finished decodes into the texture manager, within a per-frame time
+     * budget. Must run on the render thread. Leftovers stay queued and the drain
+     * re-posts itself for the next frame.
+     */
+    public static void processPendingTextureUploads() {
+        if (COMPLETED_UPLOADS.isEmpty()) {
+            return;
+        }
+        long deadline = System.nanoTime() + TEXTURE_UPLOAD_BUDGET_NANOS;
+        while (true) {
+            TextureUploadTask task = COMPLETED_UPLOADS.poll();
+            if (task == null) {
                 return;
             }
-            // One-time full translucency scan while the image is still in memory:
-            // the CPU skinning path needs to know whether a translucent second
-            // (blended) draw pass is required (see isTranslucentTexture).
-            TEXTURE_TRANSLUCENT.put(rl.toString(), hasTranslucentPixels(image));
-            Minecraft.getInstance().getTextureManager().register(rl, new DynamicTexture(image));
-            UPLOADED_TEXTURES.put(rl.toString(), Boolean.TRUE);
-        } catch (Throwable t) {
-            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to upload texture {}", rl, t);
-            UPLOADED_TEXTURES.put(rl.toString(), Boolean.TRUE);
+            String key = task.location().toString();
+            if (task.generation() != TEXTURE_GENERATION.get()) {
+                // superseded by a resource reload between decode and drain
+                closeQuietly(task.image());
+                continue;
+            }
+            try {
+                // a re-upload between decode and drain cancels a pending release
+                PENDING_TEXTURE_RELEASES.remove(key);
+                TEXTURE_TRANSLUCENT.put(key, task.translucent());
+                Minecraft.getInstance().getTextureManager().register(task.location(), new DynamicTexture(task.image()));
+                UPLOADED_TEXTURES.put(key, Boolean.TRUE);
+                // The GL texture now owns the pixels; the DynamicTexture took the
+                // image, so neither the encoded bytes nor extra references survive.
+                TEXTURE_DATA.remove(key);
+            } catch (Throwable t) {
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to upload texture {}", key, t);
+                // The image never reached a DynamicTexture: free it here or its
+                // native buffer leaks (NativeImage is off-heap).
+                closeQuietly(task.image());
+                UPLOADED_TEXTURES.put(key, Boolean.TRUE);
+                TEXTURE_DATA.remove(key);
+            }
+            if (System.nanoTime() > deadline) {
+                Minecraft.getInstance().execute(YSMMeshLibrary::processPendingTextureUploads);
+                return;
+            }
+        }
+    }
+
+    private static void closeQuietly(NativeImage image) {
+        try {
+            image.close();
+        } catch (Throwable ignored) {
+            // closing a half-uploaded image must never mask the original failure
         }
     }
 
@@ -261,6 +760,307 @@ public final class YSMMeshLibrary {
         return false;
     }
 
+    // ------------------------------------------------------------------
+    // Per-model lifecycle: usage tracking, eviction, delayed release
+    // ------------------------------------------------------------------
+
+    /**
+     * Record that one model's mesh references this texture. Called from the
+     * conversion path, which knows which texture belongs to which model.
+     *
+     * Textures are reference counted because model packs may share one: a pack's
+     * extra_textures may point at another model's file, and both models then hand
+     * out the same resource location. Eviction of one of them must not release a
+     * texture the other is still rendering with.
+     */
+    public static void bindModelTexture(String modelId, ResourceLocation texture) {
+        if (modelId == null || texture == null) {
+            return;
+        }
+        Set<String> textures = MODEL_TEXTURES.computeIfAbsent(modelId, k -> ConcurrentHashMap.newKeySet());
+        String key = texture.toString();
+        if (textures.add(key)) {
+            TEXTURE_REFS.merge(key, 1, Integer::sum);
+        }
+    }
+
+    /** Record a model usage (LRU touch): the next trim evicts it last. */
+    public static void touchModel(String modelId) {
+        if (modelId == null || EVICTION_DISABLED) {
+            return;
+        }
+        synchronized (ACCESS_ORDER) {
+            ACCESS_ORDER.put(modelId, Boolean.TRUE);
+        }
+    }
+
+    /** How many models the LRU currently tracks, i.e. hold GL resources. */
+    public static int loadedModelCount() {
+        synchronized (ACCESS_ORDER) {
+            return ACCESS_ORDER.size();
+        }
+    }
+
+    /** The configured resident-model cap. */
+    public static int modelCacheCap() {
+        return com.ysmef.geomodel.config.YSMCompatConfig.LAZY_MODEL_CACHE_SIZE.get();
+    }
+
+    /**
+     * Record that a model's mesh was actually instantiated: from here on it owns
+     * GL resources and becomes a candidate for eviction.
+     */
+    public static void markMeshLoaded(String modelId) {
+        if (modelId == null) {
+            return;
+        }
+        LOADED_MODELS.add(modelId);
+        touchModel(modelId);
+    }
+
+    /**
+     * Release the GL resources of the least recently used models while more than
+     * the configured cap are loaded. Must run on the render thread.
+     *
+     * Eviction is self-healing because Epic Fight's {@code MeshAccessor.get()}
+     * checks its mesh cache on every call and rebuilds the mesh from the
+     * generated JSON when the entry is gone - so the next draw of an evicted maid
+     * transparently re-loads her mesh. The generated JSON stays on disk, so
+     * nothing is re-converted and no model is permanently degraded.
+     */
+    public static void trimIfNeeded() {
+        if (EVICTION_DISABLED) {
+            return;
+        }
+        int cap = com.ysmef.geomodel.config.YSMCompatConfig.LAZY_MODEL_CACHE_SIZE.get();
+        List<String> victims;
+        synchronized (ACCESS_ORDER) {
+            if (ACCESS_ORDER.size() <= cap) {
+                return;
+            }
+            // Oldest entries first; the just-touched models are at the tail.
+            victims = new java.util.ArrayList<>(ACCESS_ORDER.keySet());
+        }
+        int evicted = 0;
+        for (String victim : victims) {
+            if (EVICTION_DISABLED) {
+                // The mesh cache turned out to be unreachable: stop immediately so
+                // the remaining victims keep their meshes AND their textures.
+                break;
+            }
+            int loaded;
+            synchronized (ACCESS_ORDER) {
+                loaded = ACCESS_ORDER.size();
+            }
+            if (loaded <= cap) {
+                break;
+            }
+            synchronized (ACCESS_ORDER) {
+                ACCESS_ORDER.remove(victim);
+            }
+            if (evictModel(victim)) {
+                evicted++;
+            }
+        }
+        if (evicted > 0) {
+            // Once per session at info (the log line is the only evidence the LRU
+            // runs at all); the repeats stay on debug so a small cap does not
+            // flood the log while the player moves between models.
+            if (EVICTION_LOGGED) {
+                YSMGeoCompat.LOGGER.debug("YSM-GEO Compat: evicted {} least recently used models (cap {})",
+                        evicted, cap);
+            } else {
+                EVICTION_LOGGED = true;
+                YSMGeoCompat.LOGGER.info(
+                        "YSM-GEO Compat: evicted {} least recently used models (cap {}); "
+                                + "they re-load from the generated mesh JSON on their next draw",
+                        evicted, cap);
+            }
+        }
+    }
+
+    /**
+     * Release one model's GL resources: its mesh instance, its textures and its
+     * compiled runtime scripts. Returns true when the model's mesh was released.
+     *
+     * The mesh instance is taken out of Epic Fight's own mesh cache first. That
+     * cache has no removal API, so reaching it takes reflection; when it cannot
+     * be reached the eviction is abandoned entirely (see EVICTION_DISABLED)
+     * rather than leaving a destroyed mesh behind in a cache that keeps handing
+     * it out. Nothing is released on any failure path: a model that keeps its
+     * mesh must keep its textures too.
+     */
+    private static boolean evictModel(String modelId) {
+        if (!LOADED_MODELS.remove(modelId)) {
+            // Never instantiated (or already evicted): the model owns no GL
+            // resources, so there is nothing to release and its textures stay
+            // warm for the next lookup.
+            return false;
+        }
+        Meshes.MeshAccessor<YSMMesh> accessor = TlmModelLibrary.accessorOf(modelId);
+        if (accessor == null) {
+            // Not registered any more (the registry was replaced): its mesh went
+            // with it, and the textures are re-read from the pack on next use.
+            releaseTexturesOfModel(modelId);
+            com.ysmef.geomodel.model.runtime.YSMRuntimeModel.invalidate(modelId);
+            return false;
+        }
+        YSMMesh mesh = takeFromEfMeshCache(accessor);
+        if (mesh == null) {
+            // Either Epic Fight already dropped the instance (its own reload) or
+            // the cache is unreachable; in both cases the model keeps its textures
+            // rather than losing them for nothing.
+            return false;
+        }
+        scheduleMeshRelease(mesh);
+        releaseTexturesOfModel(modelId);
+        com.ysmef.geomodel.model.runtime.YSMRuntimeModel.invalidate(modelId);
+        return true;
+    }
+
+    /**
+     * Remove the accessor's loaded mesh from Epic Fight's private static mesh
+     * cache ({@code Meshes.MESHES}, keyed by accessor, no public removal API) and
+     * return it.
+     *
+     * Returns null when the cache holds no entry for the accessor. Disables
+     * eviction for the rest of the session and returns null when the cache cannot
+     * be reached at all: the caller must then not release anything, because Epic
+     * Fight would keep drawing the destroyed instance.
+     */
+    @SuppressWarnings("unchecked")
+    private static YSMMesh takeFromEfMeshCache(Meshes.MeshAccessor<?> accessor) {
+        if (EVICTION_DISABLED) {
+            return null;
+        }
+        try {
+            java.lang.reflect.Field field = Meshes.class.getDeclaredField("MESHES");
+            field.setAccessible(true);
+            Object map = field.get(null);
+            if (!(map instanceof Map<?, ?>)) {
+                throw new IllegalStateException("not a map");
+            }
+            Object removed = ((Map<Object, Object>) map).remove(accessor);
+            return removed instanceof YSMMesh mesh ? mesh : null;
+        } catch (Throwable t) {
+            if (!EVICTION_DISABLED) {
+                EVICTION_DISABLED = true;
+                YSMGeoCompat.LOGGER.warn(
+                        "YSM-GEO Compat: Epic Fight's mesh cache is unreachable ({}); "
+                                + "model eviction is disabled for this session", t.toString());
+            }
+            return null;
+        }
+    }
+
+    /**
+     * Queue one evicted mesh for the delayed release. Must be called on the
+     * render thread; the GL deletions happen {@link #RELEASE_DELAY_TICKS} ticks
+     * later (see {@link #processPendingMeshReleases}).
+     */
+    public static void scheduleMeshRelease(YSMMesh mesh) {
+        if (mesh != null) {
+            PENDING_MESH_RELEASES.put(mesh, RELEASE_DELAY_TICKS);
+        }
+    }
+
+    /**
+     * Drop one model's texture registrations and schedule their GL release a few
+     * ticks later (a texture may still be bound by draws already recorded for
+     * this frame).
+     *
+     * @return the released resource locations, for logging
+     */
+    public static List<ResourceLocation> releaseTexturesOfModel(String modelId) {
+        Set<String> textures = MODEL_TEXTURES.remove(modelId);
+        if (textures == null || textures.isEmpty()) {
+            return List.of();
+        }
+        List<ResourceLocation> released = new java.util.ArrayList<>();
+        for (String key : textures) {
+            Integer refs = TEXTURE_REFS.get(key);
+            if (refs != null && refs > 1) {
+                // another model still renders with this texture: drop only our
+                // reference and leave the upload in place
+                TEXTURE_REFS.put(key, refs - 1);
+                continue;
+            }
+            TEXTURE_REFS.remove(key);
+            TEXTURE_DATA.remove(key);
+            UPLOADED_TEXTURES.remove(key);
+            TEXTURE_TRANSLUCENT.remove(key);
+            PENDING_TEXTURE_DECODES.remove(key);
+            PENDING_TEXTURE_RELEASES.put(key, RELEASE_DELAY_TICKS);
+            try {
+                released.add(ResourceLocation.parse(key));
+            } catch (Throwable ignored) {
+                // unparseable keys can only come from a corrupted table; the
+                // release below is driven by the key string, so it still happens
+            }
+        }
+        return released;
+    }
+
+    /**
+     * Release textures whose delay elapsed. Called from the client tick, which
+     * runs on the render thread - the texture manager may only be touched there.
+     */
+    public static void processPendingTextureReleases() {
+        for (java.util.Iterator<Map.Entry<String, Integer>> it = PENDING_TEXTURE_RELEASES.entrySet().iterator();
+             it.hasNext(); ) {
+            Map.Entry<String, Integer> entry = it.next();
+            int left = entry.getValue() - 1;
+            if (left > 0) {
+                entry.setValue(left);
+                continue;
+            }
+            it.remove();
+            try {
+                Minecraft.getInstance().getTextureManager().release(ResourceLocation.parse(entry.getKey()));
+            } catch (Throwable ignored) {
+                // a texture already released (or never registered) is not an error
+            }
+        }
+    }
+
+    /**
+     * Destroy evicted meshes whose delay elapsed. Called from the client tick:
+     * the GL deletions require the render thread.
+     */
+    public static void processPendingMeshReleases() {
+        for (java.util.Iterator<Map.Entry<YSMMesh, Integer>> it = PENDING_MESH_RELEASES.entrySet().iterator();
+             it.hasNext(); ) {
+            Map.Entry<YSMMesh, Integer> entry = it.next();
+            int left = entry.getValue() - 1;
+            if (left > 0) {
+                entry.setValue(left);
+                continue;
+            }
+            it.remove();
+            try {
+                entry.getKey().destroy();
+                disposeMesh(entry.getKey());
+            } catch (Throwable t) {
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to release evicted mesh", t);
+            }
+        }
+    }
+
+    /**
+     * The per-tick lifecycle entry point (client tick, render thread): drains the
+     * upload queue, runs the delayed releases and trims the model cache.
+     *
+     * Everything here is deferred work that must not run inside a draw: GL
+     * uploads/releases are bounded to a small budget per frame, and the eviction
+     * cap is enforced between frames.
+     */
+    public static void tick() {
+        processPendingTextureUploads();
+        processPendingTextureReleases();
+        processPendingMeshReleases();
+        trimIfNeeded();
+    }
+
     /**
      * Decode texture bytes into a NativeImage, supporting PNG/JPEG encoded data,
      * WebP/AVIF (through YSM's ImageStream, reflectively) and raw RGBA pixels
@@ -270,11 +1070,18 @@ public final class YSMMeshLibrary {
      * array onto the 64KB LWJGL MemoryStack, which overflows for large textures
      * ("Out of stack space"), while the InputStream overload buffers off-heap.
      */
-    private static NativeImage decodeTexture(ResourceLocation rl, byte[] data) throws IOException {
-        if (data.length >= 4 && (data[0] & 0xFF) == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47) {
+    private static NativeImage decodeTexture(String label, byte[] data) throws IOException {
+        if (data.length == 0) {
+            // An empty array would satisfy the raw-RGBA heuristic below
+            // (0 % 4 == 0 and 0*0 == 0) and produce a 0x0 DynamicTexture that is
+            // then marked "uploaded" forever.
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: empty texture data for {}", label);
+            return null;
+        }
+        if (isPng(data)) {
             return NativeImage.read(new ByteArrayInputStream(data));
         }
-        if (data.length >= 2 && (data[0] & 0xFF) == 0xFF && (data[1] & 0xFF) == 0xD8) {
+        if (isJpeg(data)) {
             return NativeImage.read(new ByteArrayInputStream(data));
         }
         if (isRiffWebp(data)) {
@@ -290,8 +1097,17 @@ public final class YSMMeshLibrary {
                 return readRawRgba(data, side, side);
             }
         }
-        YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: unsupported texture format for {}", rl);
+        YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: unsupported texture format for {}", label);
         return null;
+    }
+
+    private static boolean isPng(byte[] data) {
+        return data.length >= 4 && (data[0] & 0xFF) == 0x89 && data[1] == 0x50
+                && data[2] == 0x4E && data[3] == 0x47;
+    }
+
+    private static boolean isJpeg(byte[] data) {
+        return data.length >= 2 && (data[0] & 0xFF) == 0xFF && (data[1] & 0xFF) == 0xD8;
     }
 
     /**

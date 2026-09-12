@@ -28,6 +28,27 @@ import java.util.Map;
  */
 public class YSMGeoModel {
 
+    /**
+     * Maximum bone-hierarchy nesting accepted while parsing / walking a geometry.
+     * Model packs are third-party files: a cyclic or absurdly deep bone chain
+     * would otherwise recurse until the stack dies (a {@code StackOverflowError}
+     * is an {@link Error}, so the callers' {@code catch (Exception)} does not
+     * stop it from killing the render thread).
+     */
+    public static final int MAX_BONE_DEPTH = 512;
+
+    /** Fallback texture size when a model declares a nonsensical one. */
+    public static final int DEFAULT_TEXTURE_SIZE = 64;
+
+    /**
+     * Clamp a declared texture size. Model packs are third-party data and the UV
+     * math divides by these, so a declared 0 produced infinite/NaN UVs on every
+     * quad of the model (and a negative value would flip the whole UV layout).
+     */
+    public static int sanitizeTextureSize(int declared) {
+        return declared >= 1 ? declared : DEFAULT_TEXTURE_SIZE;
+    }
+
     public final List<Bone> topLevelBones = new ArrayList<>();
     public final Map<String, Bone> bonesByName = new HashMap<>();
     public int textureWidth = 64;
@@ -48,10 +69,10 @@ public class YSMGeoModel {
         JsonObject description = geo.getAsJsonObject("description");
         if (description != null) {
             if (description.has("texture_width")) {
-                model.textureWidth = description.get("texture_width").getAsInt();
+                model.textureWidth = sanitizeTextureSize(description.get("texture_width").getAsInt());
             }
             if (description.has("texture_height")) {
-                model.textureHeight = description.get("texture_height").getAsInt();
+                model.textureHeight = sanitizeTextureSize(description.get("texture_height").getAsInt());
             }
         }
 
@@ -72,7 +93,7 @@ public class YSMGeoModel {
             if (boneJson.has("parent")) {
                 continue;
             }
-            Bone bone = buildBone(model, boneJson, null, boneJsonByName);
+            Bone bone = buildBone(model, boneJson, null, boneJsonByName, 0);
             if (bone != null) {
                 model.topLevelBones.add(bone);
             }
@@ -82,7 +103,23 @@ public class YSMGeoModel {
 
     private static Bone buildBone(YSMGeoModel model, JsonObject boneJson, Bone parent,
                                   Map<String, JsonObject> boneJsonByName) {
+        return buildBone(model, boneJson, parent, boneJsonByName, 0);
+    }
+
+    private static Bone buildBone(YSMGeoModel model, JsonObject boneJson, Bone parent,
+                                  Map<String, JsonObject> boneJsonByName, int depth) {
+        if (depth > MAX_BONE_DEPTH) {
+            throw new IllegalStateException(
+                    "bone hierarchy deeper than " + MAX_BONE_DEPTH
+                            + " (cyclic or malformed parent links) in geometry");
+        }
         String name = boneJson.get("name").getAsString();
+        if (model.bonesByName.containsKey(name)) {
+            // Duplicate names previously overwrote the map entry and built the
+            // same bone twice as a child, duplicating geometry and binding it to
+            // the wrong joint.
+            throw new IllegalStateException("duplicate bone name in geometry: " + name);
+        }
         Bone bone = new Bone();
         bone.name = name;
         bone.parent = parent;
@@ -111,7 +148,7 @@ public class YSMGeoModel {
         for (Map.Entry<String, JsonObject> entry : boneJsonByName.entrySet()) {
             JsonObject childJson = entry.getValue();
             if (childJson.has("parent") && childJson.get("parent").getAsString().equals(name)) {
-                Bone child = buildBone(model, childJson, bone, boneJsonByName);
+                Bone child = buildBone(model, childJson, bone, boneJsonByName, depth + 1);
                 bone.children.add(child);
             }
         }

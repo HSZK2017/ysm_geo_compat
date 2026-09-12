@@ -1,0 +1,14 @@
+{
+  "required": false,
+  "minVersion": "0.8",
+  "package": "com.ysmef.geomodel.mixin.ysm",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "ysm_geo_compat.refmap.json",
+  "plugin": "com.ysmef.geomodel.mixin.YsmGeoMixinPlugin",
+  "client": [
+    "YsmAnimationTransitionGuardMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

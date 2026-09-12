@@ -29,6 +29,15 @@ versionRange="[1.20.1,1.21)"
 ordering="NONE"
 side="BOTH"
 [[dependencies.ysm_geo_compat]]
+# Deliberately the same range as EpicFight_TouhouLittleMaid's own dependency:
+# this mod ships jarJar-embedded inside EFTLM (libs/YSM_GEO_Compat.jar), so a
+# narrower range here would fail the mandatory-dependency check for players who
+# can load EFTLM itself - a nested mod error that is hard to diagnose. Anything
+# newer than the validated 20.14.17 therefore has to degrade at runtime instead:
+# the mixin targets, the reflected SkinnedMesh field and the ComputeShaderSetup
+# API are all reached behind failure-tolerant lookups that fall back to Epic
+# Fight's own render path. Re-validate those against 20.15 before widening EF's
+# own range in EFTLM.
 modId="epicfight"
 mandatory=true
 versionRange="[20.14,)"

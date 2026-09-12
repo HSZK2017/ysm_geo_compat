@@ -86,17 +86,17 @@ public final class TlmGeoModelParser {
     public static YSMGeoModel parse(String json) {
         JsonObject root = JsonParser.parseString(json).getAsJsonObject();
 
-        int texWidth = 64;
-        int texHeight = 64;
+        int texWidth = YSMGeoModel.DEFAULT_TEXTURE_SIZE;
+        int texHeight = YSMGeoModel.DEFAULT_TEXTURE_SIZE;
         JsonArray bones = null;
 
         if (root.has("geometry.model")) {
             JsonObject geo = root.getAsJsonObject("geometry.model");
             if (geo.has("texturewidth")) {
-                texWidth = geo.get("texturewidth").getAsInt();
+                texWidth = YSMGeoModel.sanitizeTextureSize(geo.get("texturewidth").getAsInt());
             }
             if (geo.has("textureheight")) {
-                texHeight = geo.get("textureheight").getAsInt();
+                texHeight = YSMGeoModel.sanitizeTextureSize(geo.get("textureheight").getAsInt());
             }
             bones = geo.getAsJsonArray("bones");
         } else if (root.has("minecraft:geometry")) {
@@ -108,10 +108,10 @@ public final class TlmGeoModelParser {
             JsonObject description = geo.getAsJsonObject("description");
             if (description != null) {
                 if (description.has("texture_width")) {
-                    texWidth = description.get("texture_width").getAsInt();
+                    texWidth = YSMGeoModel.sanitizeTextureSize(description.get("texture_width").getAsInt());
                 }
                 if (description.has("texture_height")) {
-                    texHeight = description.get("texture_height").getAsInt();
+                    texHeight = YSMGeoModel.sanitizeTextureSize(description.get("texture_height").getAsInt());
                 }
             }
             bones = geo.getAsJsonArray("bones");
@@ -149,6 +149,25 @@ public final class TlmGeoModelParser {
                                               Map<String, JsonObject> boneJsonByName,
                                               Map<String, float[]> pivotByName,
                                               Map<String, YSMGeoModel.Bone> boneByName) {
+        return buildBone(model, boneJson, boneJsonByName, pivotByName, boneByName, 0);
+    }
+
+    private static YSMGeoModel.Bone buildBone(YSMGeoModel model, JsonObject boneJson,
+                                              Map<String, JsonObject> boneJsonByName,
+                                              Map<String, float[]> pivotByName,
+                                              Map<String, YSMGeoModel.Bone> boneByName,
+                                              int depth) {
+        // Depth guard. The memo below (boneByName) is only written after the
+        // parent has been built, so a parent cycle ("A" -> "B" -> "A") never hits
+        // the existing-bone short circuit and recurses forever; MAX_BONE_DEPTH
+        // turns that (and a pathologically deep chain) into a controlled
+        // exception the caller logs and skips, instead of a StackOverflowError
+        // on the render thread.
+        if (depth > YSMGeoModel.MAX_BONE_DEPTH) {
+            throw new IllegalStateException(
+                    "bone hierarchy deeper than " + YSMGeoModel.MAX_BONE_DEPTH
+                            + " in TLM geometry (cyclic or malformed parent links)");
+        }
         String name = boneJson.get("name").getAsString();
         YSMGeoModel.Bone existing = boneByName.get(name);
         if (existing != null) {
@@ -164,7 +183,8 @@ public final class TlmGeoModelParser {
         String parentName = boneJson.has("parent") ? boneJson.get("parent").getAsString() : null;
         YSMGeoModel.Bone parent = null;
         if (parentName != null && boneJsonByName.containsKey(parentName)) {
-            parent = buildBone(model, boneJsonByName.get(parentName), boneJsonByName, pivotByName, boneByName);
+            parent = buildBone(model, boneJsonByName.get(parentName), boneJsonByName, pivotByName,
+                    boneByName, depth + 1);
         }
 
         // Epic Fight-space (y-up) absolute bone pivots, plain bedrock values:

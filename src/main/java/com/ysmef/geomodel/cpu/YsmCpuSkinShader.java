@@ -53,8 +53,29 @@ public final class YsmCpuSkinShader {
      * 3.3+ (or newer) or OpenGL ES 3.0+. This is deliberately independent of
      * the GPU path's OpenGL 4.3 / ES 3.1 gate - the CPU path exists precisely
      * for contexts below that.
+     *
+     * Cached: this runs for every CPU-path candidate draw, and a
+     * glGetString(GL_VERSION) per entity per frame is pure render-thread waste.
+     * The client GL context version cannot change during a session.
      */
+    private static volatile boolean capabilityChecked = false;
+    private static volatile boolean capabilityAvailable = false;
+
     public static boolean isCapabilityAvailable() {
+        if (capabilityChecked) {
+            return capabilityAvailable;
+        }
+        synchronized (YsmCpuSkinShader.class) {
+            if (capabilityChecked) {
+                return capabilityAvailable;
+            }
+            capabilityAvailable = probeCapability();
+            capabilityChecked = true;
+            return capabilityAvailable;
+        }
+    }
+
+    private static boolean probeCapability() {
         try {
             RenderSystem.assertOnRenderThreadOrInit();
             GLCapabilities caps = GL.getCapabilities();

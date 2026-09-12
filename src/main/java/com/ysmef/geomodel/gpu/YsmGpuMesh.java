@@ -158,6 +158,10 @@ public final class YsmGpuMesh {
         }
 
         ByteBuffer vertexBuf = MemoryUtil.memAlloc(totalVertices * VERTEX_STRIDE).order(ByteOrder.nativeOrder());
+        // Allocate the per-frame bone buffer BEFORE creating any GL object: the
+        // caller catches Throwable and marks the mesh UNSUPPORTED forever, so an
+        // OOM here would otherwise leak the VAO + VBO + SSBO for the session.
+        ByteBuffer perFrame = MemoryUtil.memAlloc((jointCount + partCount) * BONE_STRIDE).order(ByteOrder.nativeOrder());
         try {
             partIdx = 0;
             for (SkinnedMeshPart part : mesh.getAllParts()) {
@@ -214,25 +218,19 @@ public final class YsmGpuMesh {
             GL43.glBufferData(GL43.GL_SHADER_STORAGE_BUFFER, (long) (jointCount + partCount) * BONE_STRIDE, GL15.GL_DYNAMIC_DRAW);
             GlStateManager._glBindBuffer(GL43.GL_SHADER_STORAGE_BUFFER, 0);
 
-            return new YsmGpuMesh(vao, vbo, boneSsbo, totalVertices, jointCount + partCount, jointOfPart,
-                    MemoryUtil.memAlloc((jointCount + partCount) * BONE_STRIDE).order(ByteOrder.nativeOrder()));
+            return new YsmGpuMesh(vao, vbo, boneSsbo, totalVertices, jointCount + partCount, jointOfPart, perFrame);
+        } catch (Throwable t) {
+            MemoryUtil.memFree(perFrame);
+            throw t;
         } finally {
             MemoryUtil.memFree(vertexBuf);
         }
     }
 
     /** Pack a normal into the GL_INT_2_10_10_10_REV layout (same unpack as bone_skin.vsh). */
+    /** Pack a normal into the GL_INT_2_10_10_10_REV layout (single shared implementation). */
     static int packNormal(float x, float y, float z) {
-        float len = (float) Math.sqrt(x * x + y * y + z * z);
-        if (len > 1e-6f) {
-            x /= len;
-            y /= len;
-            z /= len;
-        }
-        int xi = Math.max(-511, Math.min(511, Math.round(x * 511)));
-        int yi = Math.max(-511, Math.min(511, Math.round(y * 511)));
-        int zi = Math.max(-511, Math.min(511, Math.round(z * 511)));
-        return (xi & 0x3FF) | ((yi & 0x3FF) << 10) | ((zi & 0x3FF) << 20);
+        return com.ysmef.geomodel.renderer.GlRenderState.packNormal(x, y, z);
     }
 
     public void dispose() {

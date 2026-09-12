@@ -14,10 +14,14 @@ import java.util.Set;
  * is installed it already applies the identical guard, and applying a second
  * redirect from this mod would conflict with it. This plugin therefore
  * disables the guard whenever ysm_epicfight_compat is present.
+ *
+ * Declared as the {@code "plugin"} of ysm_geo_compat.ysm.mixins.json, which is
+ * the only config that lists the guard (it must stay out of the required main
+ * config: it targets YSM by name and this mod has no YSM dependency).
  */
 public final class YsmGeoMixinPlugin implements IMixinConfigPlugin {
 
-    private static final String GUARD_MIXIN = "com.ysmef.geomodel.mixin.YsmAnimationTransitionGuardMixin";
+    private static final String GUARD_MIXIN = "com.ysmef.geomodel.mixin.ysm.YsmAnimationTransitionGuardMixin";
     private static final String MAIN_MOD = "ysm_epicfight_compat";
 
     private final boolean mainCompatInstalled = isMainCompatInstalled();
