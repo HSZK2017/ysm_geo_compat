@@ -132,7 +132,8 @@ config/ysm_geo_compat/
 - **YSM 让位**：`YsmMaidRendererMixin` 对 `EntityMaid#isYsmModel()` 的女仆直接返回、不设置返回值——YSM 女仆完整交给 YSM_EpicFight_Compat 的同名注入器，避免两个模组对同一 `CallbackInfoReturnable` 双重 `setReturnValue`（Mixin 0.8.5 下第二次调用抛 CancellationException）。
 - **默认形态**（`YSMRuntimeModel.computeDefaultHidden`）：用中性 molang 环境（满血 20/20、站立、空闲）静态求值平行脚本，得到默认形态骨骼可见性；战斗模式只渲染默认形态。
 - **依赖方向**：`model` 包不引用 `gpu`/`cpu` 包——绘制经 `RenderBridgeRegistry`、释放经 `MeshReleaser`，两条路径在静态块中自注册，`RenderPaths.init()` 负责在启动期触发并校验（注册不完整会 ERROR，不会静默退化）。
-- **路径安全**：模型包是第三方文件，所有 `model_id` 与清单内 `model`/`texture`/`animation`/`extra_textures` 路径都经 `sanitize`（中和 `..`/`.` 与空段）与 `resolveInside` 词法围栏后才落地文件系统。
+- **路径安全**：模型包是第三方文件，所有 `model_id` 与清单内 `model`/`texture`/`animation`/`extra_textures` 路径都经 `sanitize`（中和 `..`/`.` 与空段）与 `resolveInside` 词法围栏后才落地文件系统；磁盘读取另做真实路径检查，生成文件拒绝链接目录，单文件默认限制为 128 MiB。
+- **部件与关节匹配**：`y/<骨骼名>` 网格部件精确对应运行时骨骼。Epic Fight 关节先由骨骼语义确定类型，再依据骨骼层级、模型空间顶点位置、髋部高度和大腿长度校正左右肢体及腰部衣物的归属；网格顶点与运行时骨骼表共用这一决策。
 - **逐动画容错**：单个动画 molang 编译失败只跳过该动画并告警（`Molang.ErrorReporter`），不会让整个模型退回"全变体可见"。
 - **变体 id 算法**：与 TLM 完全一致——`MD5(extraTexture.getPath()).toLowerCase()`，`模型id_<32hex>`。
 - **GL 状态自恢复**：两条直接路径都用 `GlRenderState` 快照/还原，且还原在 `finally` 中逐项守护，异常不会污染后续渲染。
@@ -144,7 +145,7 @@ config/ysm_geo_compat/
 要求：JDK 17+（Gradle 运行使用 JDK 21，见 `gradle.properties`）。
 
 ```bash
-./gradlew build     # 产物：build/libs/YSM_GEO_Compat-1.20.1-1.0.3.jar（无内嵌库，无 -all 变体）
+./gradlew build     # 产物：build/libs/YSM_GEO_Compat-1.20.1-1.1.0.jar（无内嵌库，无 -all 变体）
 ./gradlew test      # 单元测试（molang 求值/路径围栏/关节表与骨名归一化）
 ```
 
@@ -154,7 +155,7 @@ config/ysm_geo_compat/
 
 ## 安装
 
-1. 将 `YSM_GEO_Compat-1.20.1-1.0.3.jar` 放入 `mods/`。
+1. 将 `YSM_GEO_Compat-1.20.1-1.1.0.jar` 放入 `mods/`。
 2. 必装 Epic Fight；女仆支持需 Touhou Little Maid + EpicFight_TouhouLittleMaid。
 3. 需要玩家 YSM 模型或 YSM 女仆时，同时安装 YSM_EpicFight_Compat（本模组与其共存时仅处理 TLM 模型）。
 
@@ -170,7 +171,7 @@ config/ysm_geo_compat/
 
 - `enableGpuRender`：使用 GPU 蒙皮路径。运行时不可用会自动关闭（与 ModernYSM 的 `UseGpuRenderer` 行为一致）。
 - `scriptAsyncEval`：非本地实体的脚本求值在后台线程执行（双缓冲），默认开。
-- `lazyModelCacheSize`：常驻女仆模型数上限（默认 64，范围 8–512）。超出时按 LRU 释放网格与贴图，
+- `lazyModelCacheSize`：常驻女仆网格数上限（默认 64，范围 8–512；共享网格的额外贴图变体只计一次）。超出时按 LRU 释放网格与贴图，
   该模型下次被绘制时由 Epic Fight 从生成的网格 JSON 重新加载（不重转换、不会永久失效；
   贴图从生成资源包文件重新读取）。
 
@@ -191,6 +192,7 @@ config/ysm_geo_compat/
 | `-Dysm_geo_compat.diag=true` | 输出逐次绘制被哪条路径拒绝及原因、GPU 输入诊断等 |
 | `-Dysm_geo_compat.disable_gpu` | 强制停用 GPU 路径 |
 | `-Dysm_geo_compat.force_cpu_render` | 跳过 EF 计算着色器，强制走 CPU 蒙皮路径（验证回退链） |
+| `-Dysm_geo_compat.max_pack_file_bytes=134217728` | 模型包单文件读取上限，默认 128 MiB |
 
 ## 开发注意事项
 

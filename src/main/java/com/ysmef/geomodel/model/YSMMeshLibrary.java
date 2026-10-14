@@ -27,6 +27,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 import javax.imageio.ImageIO;
 
 /**
@@ -105,14 +106,15 @@ public final class YSMMeshLibrary {
      */
     private static final Queue<TextureUploadTask> COMPLETED_UPLOADS = new ConcurrentLinkedQueue<>();
 
-    /** textureRL strings currently being decoded on the background pool. */
-    private static final Set<String> PENDING_TEXTURE_DECODES = ConcurrentHashMap.newKeySet();
+    /** Each registration or restored eviction receives a distinct texture identity. */
+    private static final AtomicLong NEXT_TEXTURE_TOKEN = new AtomicLong();
+    private static final Map<String, Long> TEXTURE_TOKENS = new ConcurrentHashMap<>();
+
+    /** textureRL -> token of the decode currently owned by the background pool. */
+    private static final Map<String, Long> PENDING_TEXTURE_DECODES = new ConcurrentHashMap<>();
 
     /** textureRL string -> ticks left before its GL texture is released. */
     private static final Map<String, Integer> PENDING_TEXTURE_RELEASES = new ConcurrentHashMap<>();
-
-    /** Evicted meshes -> ticks left before their GL resources are destroyed. */
-    private static final Map<YSMMesh, Integer> PENDING_MESH_RELEASES = new ConcurrentHashMap<>();
 
     /**
      * Ticks an evicted mesh/texture is kept alive after eviction.
@@ -125,6 +127,10 @@ public final class YSMMeshLibrary {
      * dropped from Epic Fight's cache and a fresh instance has taken over.
      */
     private static final int RELEASE_DELAY_TICKS = 5;
+
+    /** Evicted meshes are no longer in Epic Fight's cache and must be destroyed on reload. */
+    private static final DelayedReleaseQueue<YSMMesh> PENDING_MESH_RELEASES =
+            new DelayedReleaseQueue<>(RELEASE_DELAY_TICKS, YSMMeshLibrary::releaseMesh);
 
     /**
      * Wall-clock budget for the per-frame texture upload drain (ModernYSM's
@@ -170,21 +176,8 @@ public final class YSMMeshLibrary {
             });
 
     /** One decoded texture waiting for its render-thread GL upload. */
-    private record TextureUploadTask(ResourceLocation location, NativeImage image, boolean translucent, int generation) {}
-
-    /**
-     * Incremented by {@link #invalidateAll()}: a decode that started before a
-     * resource reload must not upload its (now stale) image after it.
-     *
-     * Without this a texture whose decode was in flight when the reload dropped
-     * every upload state would re-register its old pixels and mark the location
-     * uploaded - and the freshly re-registered bytes of the new generation would
-     * then never be uploaded, so a changed texture file only applied after a
-     * restart. That is exactly the bug the invalidation exists to prevent, just
-     * through a narrower window.
-     */
-    private static final java.util.concurrent.atomic.AtomicInteger TEXTURE_GENERATION =
-            new java.util.concurrent.atomic.AtomicInteger();
+    private record TextureUploadTask(ResourceLocation location, NativeImage image,
+                                     boolean translucent, long token) {}
 
     /**
      * Background pool for runtime-script preloads (compiling a runtime model
@@ -293,25 +286,33 @@ public final class YSMMeshLibrary {
      * and {@code TEXTURE_TRANSLUCENT} stayed stale too.
      */
     public static void invalidateAll() {
-        TEXTURE_DATA.clear();
-        UPLOADED_TEXTURES.clear();
-        TEXTURE_TRANSLUCENT.clear();
-        TEXTURE_REFS.clear();
-        MODEL_TEXTURES.clear();
-        PENDING_TEXTURE_DECODES.clear();
-        PENDING_TEXTURE_RELEASES.clear();
-        // Supersede any decode still running on the pool (see TEXTURE_GENERATION).
-        TEXTURE_GENERATION.incrementAndGet();
-        // Decoded but not yet uploaded images own native (off-heap) buffers: the
-        // dynamic textures of the previous generation are dropped by the reload
-        // and these images will never be registered, so they must be closed here
-        // or every reload leaks them.
+        // These meshes have already been removed from Epic Fight's cache. A
+        // reload cannot hand their destruction back to Epic Fight.
+        PENDING_MESH_RELEASES.releaseAll();
+        Set<String> textureKeys;
+        synchronized (TEXTURE_TOKENS) {
+            textureKeys = new java.util.HashSet<>(UPLOADED_TEXTURES.keySet());
+            textureKeys.addAll(PENDING_TEXTURE_RELEASES.keySet());
+            TEXTURE_TOKENS.clear();
+            TEXTURE_DATA.clear();
+            UPLOADED_TEXTURES.clear();
+            TEXTURE_TRANSLUCENT.clear();
+            TEXTURE_REFS.clear();
+            MODEL_TEXTURES.clear();
+            PENDING_TEXTURE_DECODES.clear();
+            PENDING_TEXTURE_RELEASES.clear();
+        }
+        // Decoded but not yet uploaded images own native (off-heap) buffers.
         for (TextureUploadTask task = COMPLETED_UPLOADS.poll(); task != null; task = COMPLETED_UPLOADS.poll()) {
             closeQuietly(task.image());
         }
-        // Delayed-released meshes are covered by disposeAllPaths() on the reload
-        // path; dropping the queue keeps them from being destroyed a second time.
-        PENDING_MESH_RELEASES.clear();
+        for (String key : textureKeys) {
+            try {
+                Minecraft.getInstance().getTextureManager().release(ResourceLocation.parse(key));
+            } catch (Throwable t) {
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to release texture {} on reload", key, t);
+            }
+        }
         LOADED_MODELS.clear();
         synchronized (ACCESS_ORDER) {
             ACCESS_ORDER.clear();
@@ -495,7 +496,15 @@ public final class YSMMeshLibrary {
         }
         ResourceLocation rl = ResourceLocation.fromNamespaceAndPath(MESH_NAMESPACE,
                 "textures/" + safePath + ".png");
-        TEXTURE_DATA.put(rl.toString(), data);
+        String key = rl.toString();
+        synchronized (TEXTURE_TOKENS) {
+            TEXTURE_TOKENS.put(key, NEXT_TEXTURE_TOKEN.incrementAndGet());
+            TEXTURE_DATA.put(key, data);
+            PENDING_TEXTURE_DECODES.remove(key);
+            UPLOADED_TEXTURES.remove(key);
+            TEXTURE_TRANSLUCENT.remove(key);
+            PENDING_TEXTURE_RELEASES.remove(key);
+        }
         writePackTexture(safePath, data);
         return rl;
     }
@@ -540,16 +549,15 @@ public final class YSMMeshLibrary {
             return;
         }
         try {
-            Files.createDirectories(file.getParent());
             if (isPng(data) || isJpeg(data)) {
-                Files.write(file, data);
+                PackFileIO.writeAtomically(file, PACK_ROOT, tmp -> Files.write(tmp, data));
             } else {
                 NativeImage image = decodeTexture(safeRelativePath, data);
                 if (image == null) {
                     return;
                 }
                 try {
-                    image.writeToFile(file);
+                    PackFileIO.writeAtomically(file, PACK_ROOT, image::writeToFile);
                 } finally {
                     image.close();
                 }
@@ -582,17 +590,21 @@ public final class YSMMeshLibrary {
             return;
         }
         String key = rl.toString();
-        if (UPLOADED_TEXTURES.containsKey(key) || PENDING_TEXTURE_DECODES.contains(key)) {
+        if (UPLOADED_TEXTURES.containsKey(key)) {
+            return;
+        }
+        Long token = TEXTURE_TOKENS.get(key);
+        if (token == null) {
             return;
         }
         byte[] data = TEXTURE_DATA.get(key);
-        if (!PENDING_TEXTURE_DECODES.add(key)) {
+        if (PENDING_TEXTURE_DECODES.putIfAbsent(key, token) != null) {
             return;
         }
         // a re-upload cancels any delayed release of the same location
         PENDING_TEXTURE_RELEASES.remove(key);
-        int generation = TEXTURE_GENERATION.get();
         DECODE_POOL.execute(() -> {
+            NativeImage image = null;
             try {
                 byte[] bytes = data;
                 if (bytes == null) {
@@ -606,36 +618,51 @@ public final class YSMMeshLibrary {
                 if (bytes == null) {
                     return;
                 }
-                NativeImage image = decodeTexture(key, bytes);
-                if (generation != TEXTURE_GENERATION.get()) {
-                    // A resource reload happened while this image was decoding: the
-                    // bytes belong to the previous generation, so the image is
-                    // dropped (and closed) instead of being uploaded over the new
-                    // one's registration.
-                    closeQuietly(image);
-                    return;
-                }
+                image = decodeTexture(key, bytes);
                 if (image == null) {
-                    UPLOADED_TEXTURES.put(key, Boolean.TRUE);
-                    TEXTURE_DATA.remove(key);
+                    markTextureDecodeFailed(key, token, data);
                     return;
                 }
                 // The translucency scan runs here, on the decode worker: the
                 // per-frame upload drain has a small time budget and must not
                 // spend it scanning millions of pixels.
                 boolean translucent = hasTranslucentPixels(image);
-                COMPLETED_UPLOADS.add(new TextureUploadTask(rl, image, translucent, generation));
-                // Wake the render thread for the drain instead of waiting for the
-                // next frame - the texture is typically needed right now.
-                Minecraft.getInstance().execute(YSMMeshLibrary::processPendingTextureUploads);
+                if (isCurrentTexture(key, token)) {
+                    COMPLETED_UPLOADS.add(new TextureUploadTask(rl, image, translucent, token));
+                    image = null; // the queue owns the native buffer now
+                    try {
+                        Minecraft.getInstance().execute(YSMMeshLibrary::processPendingTextureUploads);
+                    } catch (Throwable t) {
+                        // The client tick also drains this queue, so the image is
+                        // still owned and will be uploaded or closed there.
+                        YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to schedule texture upload {}", key, t);
+                    }
+                }
             } catch (Throwable t) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to decode texture {}", key, t);
-                UPLOADED_TEXTURES.put(key, Boolean.TRUE);
-                TEXTURE_DATA.remove(key);
+                markTextureDecodeFailed(key, token, data);
             } finally {
-                PENDING_TEXTURE_DECODES.remove(key);
+                if (image != null) {
+                    closeQuietly(image);
+                }
+                PENDING_TEXTURE_DECODES.remove(key, token);
             }
         });
+    }
+
+    private static boolean isCurrentTexture(String key, long token) {
+        return Long.valueOf(token).equals(TEXTURE_TOKENS.get(key));
+    }
+
+    private static void markTextureDecodeFailed(String key, long token, byte[] registeredBytes) {
+        synchronized (TEXTURE_TOKENS) {
+            if (isCurrentTexture(key, token)) {
+                UPLOADED_TEXTURES.put(key, Boolean.TRUE);
+                if (registeredBytes != null) {
+                    TEXTURE_DATA.remove(key, registeredBytes);
+                }
+            }
+        }
     }
 
     /**
@@ -656,10 +683,11 @@ public final class YSMMeshLibrary {
         }
         try {
             Path file = resolveInside(PACK_ROOT.resolve("assets").resolve(MESH_NAMESPACE), rl.getPath());
-            if (file == null || !Files.isRegularFile(file)) {
+            if (file == null || !Files.isRegularFile(file)
+                    || !PackFileIO.isInsideReal(file, PACK_ROOT)) {
                 return null;
             }
-            return Files.readAllBytes(file);
+            return PackFileIO.readBytes(file);
         } catch (Throwable t) {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to re-read texture {} from the pack: {}",
                     rl, t.toString());
@@ -683,28 +711,30 @@ public final class YSMMeshLibrary {
                 return;
             }
             String key = task.location().toString();
-            if (task.generation() != TEXTURE_GENERATION.get()) {
-                // superseded by a resource reload between decode and drain
+            if (!isCurrentTexture(key, task.token())) {
+                // This resource was evicted or replaced after decoding.
+                closeQuietly(task.image());
+                continue;
+            }
+            DynamicTexture texture;
+            try {
+                texture = new DynamicTexture(task.image());
+            } catch (Throwable t) {
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to create texture {}", key, t);
                 closeQuietly(task.image());
                 continue;
             }
             try {
-                // a re-upload between decode and drain cancels a pending release
-                PENDING_TEXTURE_RELEASES.remove(key);
-                TEXTURE_TRANSLUCENT.put(key, task.translucent());
-                Minecraft.getInstance().getTextureManager().register(task.location(), new DynamicTexture(task.image()));
-                UPLOADED_TEXTURES.put(key, Boolean.TRUE);
-                // The GL texture now owns the pixels; the DynamicTexture took the
-                // image, so neither the encoded bytes nor extra references survive.
-                TEXTURE_DATA.remove(key);
+                Minecraft.getInstance().getTextureManager().register(task.location(), texture);
             } catch (Throwable t) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to upload texture {}", key, t);
-                // The image never reached a DynamicTexture: free it here or its
-                // native buffer leaks (NativeImage is off-heap).
-                closeQuietly(task.image());
-                UPLOADED_TEXTURES.put(key, Boolean.TRUE);
-                TEXTURE_DATA.remove(key);
+                texture.close();
+                continue;
             }
+            PENDING_TEXTURE_RELEASES.remove(key);
+            TEXTURE_TRANSLUCENT.put(key, task.translucent());
+            UPLOADED_TEXTURES.put(key, Boolean.TRUE);
+            TEXTURE_DATA.remove(key);
             if (System.nanoTime() > deadline) {
                 Minecraft.getInstance().execute(YSMMeshLibrary::processPendingTextureUploads);
                 return;
@@ -780,13 +810,17 @@ public final class YSMMeshLibrary {
         Set<String> textures = MODEL_TEXTURES.computeIfAbsent(modelId, k -> ConcurrentHashMap.newKeySet());
         String key = texture.toString();
         if (textures.add(key)) {
-            TEXTURE_REFS.merge(key, 1, Integer::sum);
+            synchronized (TEXTURE_TOKENS) {
+                TEXTURE_REFS.merge(key, 1, Integer::sum);
+                TEXTURE_TOKENS.computeIfAbsent(key, ignored -> NEXT_TEXTURE_TOKEN.incrementAndGet());
+                PENDING_TEXTURE_RELEASES.remove(key);
+            }
         }
     }
 
     /** Record a model usage (LRU touch): the next trim evicts it last. */
     public static void touchModel(String modelId) {
-        if (modelId == null || EVICTION_DISABLED) {
+        if (modelId == null || EVICTION_DISABLED || !LOADED_MODELS.contains(modelId)) {
             return;
         }
         synchronized (ACCESS_ORDER) {
@@ -814,8 +848,14 @@ public final class YSMMeshLibrary {
         if (modelId == null) {
             return;
         }
-        LOADED_MODELS.add(modelId);
-        touchModel(modelId);
+        String meshOwnerId = TlmModelLibrary.meshOwnerOf(modelId);
+        if (LOADED_MODELS.add(meshOwnerId)) {
+            TlmModelLibrary.bindTexturesOfMesh(meshOwnerId);
+            // Eviction also drops the compiled runtime model. Claim its preload
+            // before this mesh is drawn so get() cannot compile it in the pass.
+            preloadRuntimeAsync(meshOwnerId);
+        }
+        touchModel(meshOwnerId);
     }
 
     /**
@@ -902,7 +942,7 @@ public final class YSMMeshLibrary {
             // Not registered any more (the registry was replaced): its mesh went
             // with it, and the textures are re-read from the pack on next use.
             releaseTexturesOfModel(modelId);
-            com.ysmef.geomodel.model.runtime.YSMRuntimeModel.invalidate(modelId);
+            TlmModelLibrary.invalidateRuntimeModelsOfMesh(modelId);
             return false;
         }
         YSMMesh mesh = takeFromEfMeshCache(accessor);
@@ -910,11 +950,19 @@ public final class YSMMeshLibrary {
             // Either Epic Fight already dropped the instance (its own reload) or
             // the cache is unreachable; in both cases the model keeps its textures
             // rather than losing them for nothing.
+            if (EVICTION_DISABLED) {
+                // The accessor may still own its mesh; keep the residency count
+                // so prewarming stops at the cap even without eviction support.
+                LOADED_MODELS.add(modelId);
+                synchronized (ACCESS_ORDER) {
+                    ACCESS_ORDER.put(modelId, Boolean.TRUE);
+                }
+            }
             return false;
         }
         scheduleMeshRelease(mesh);
         releaseTexturesOfModel(modelId);
-        com.ysmef.geomodel.model.runtime.YSMRuntimeModel.invalidate(modelId);
+        TlmModelLibrary.invalidateRuntimeModelsOfMesh(modelId);
         return true;
     }
 
@@ -960,7 +1008,7 @@ public final class YSMMeshLibrary {
      */
     public static void scheduleMeshRelease(YSMMesh mesh) {
         if (mesh != null) {
-            PENDING_MESH_RELEASES.put(mesh, RELEASE_DELAY_TICKS);
+            PENDING_MESH_RELEASES.schedule(mesh);
         }
     }
 
@@ -985,12 +1033,15 @@ public final class YSMMeshLibrary {
                 TEXTURE_REFS.put(key, refs - 1);
                 continue;
             }
-            TEXTURE_REFS.remove(key);
-            TEXTURE_DATA.remove(key);
-            UPLOADED_TEXTURES.remove(key);
-            TEXTURE_TRANSLUCENT.remove(key);
-            PENDING_TEXTURE_DECODES.remove(key);
-            PENDING_TEXTURE_RELEASES.put(key, RELEASE_DELAY_TICKS);
+            synchronized (TEXTURE_TOKENS) {
+                TEXTURE_TOKENS.remove(key);
+                TEXTURE_REFS.remove(key);
+                TEXTURE_DATA.remove(key);
+                UPLOADED_TEXTURES.remove(key);
+                TEXTURE_TRANSLUCENT.remove(key);
+                PENDING_TEXTURE_DECODES.remove(key);
+                PENDING_TEXTURE_RELEASES.put(key, RELEASE_DELAY_TICKS);
+            }
             try {
                 released.add(ResourceLocation.parse(key));
             } catch (Throwable ignored) {
@@ -1028,21 +1079,19 @@ public final class YSMMeshLibrary {
      * the GL deletions require the render thread.
      */
     public static void processPendingMeshReleases() {
-        for (java.util.Iterator<Map.Entry<YSMMesh, Integer>> it = PENDING_MESH_RELEASES.entrySet().iterator();
-             it.hasNext(); ) {
-            Map.Entry<YSMMesh, Integer> entry = it.next();
-            int left = entry.getValue() - 1;
-            if (left > 0) {
-                entry.setValue(left);
-                continue;
-            }
-            it.remove();
-            try {
-                entry.getKey().destroy();
-                disposeMesh(entry.getKey());
-            } catch (Throwable t) {
-                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to release evicted mesh", t);
-            }
+        PENDING_MESH_RELEASES.processTick();
+    }
+
+    private static void releaseMesh(YSMMesh mesh) {
+        try {
+            mesh.destroy();
+        } catch (Throwable t) {
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to destroy evicted mesh", t);
+        }
+        try {
+            disposeMesh(mesh);
+        } catch (Throwable t) {
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to release evicted mesh draw paths", t);
         }
     }
 
@@ -1250,6 +1299,6 @@ public final class YSMMeshLibrary {
      * render thread.
      */
     public static void preloadRuntimeAsync(String modelId) {
-        PRELOAD_POOL.submit(() -> YSMRuntimeModel.preload(modelId));
+        YSMRuntimeModel.preloadAsync(modelId, PRELOAD_POOL);
     }
 }

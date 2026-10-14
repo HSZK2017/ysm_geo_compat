@@ -89,19 +89,11 @@ public class YSMCompatClientEvents {
             // and the old instances are dropped, so the cached per-model armatures
             // would otherwise keep the stale geometry-derived pivots alive.
             com.ysmef.geomodel.model.runtime.YsmBindArmature.invalidateAll();
-            // Release the CPU/GPU skinning paths' per-mesh GL buffers (VBO/VAO/
-            // bone SSBO) of the previous mesh generation: the meshes themselves
-            // are regenerated below and the old instances are dropped, so their
-            // render-path resources would otherwise leak one dynamic VBO + CPU
-            // buffer (CPU path) / one static VBO + bone SSBO (GPU path) per
-            // model per reload. Dispatched through the registry so this class
-            // does not have to know which paths exist.
-            YSMMeshLibrary.disposeAllPaths();
-            // Without this the reload was a no-op for textures: the upload-state
-            // map still contained the location, so the bytes re-registered below
-            // were never uploaded and a changed texture only applied after a
-            // restart.
+            // Destroy evicted meshes that are no longer owned by Epic Fight,
+            // revoke old texture tasks and release dynamic textures first.
             YSMMeshLibrary.invalidateAll();
+            // Then free the CPU/GPU paths' resources for all remaining meshes.
+            YSMMeshLibrary.disposeAllPaths();
             // Per-player once-log state (renderer.YSMMeshSelector) is dropped too,
             // so diagnostics stay useful after a reload.
             com.ysmef.geomodel.renderer.YSMMeshSelector.clear();

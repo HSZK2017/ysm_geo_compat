@@ -36,7 +36,8 @@ public final class TlmModelLibrary {
 
     private static final Path MESH_DIR = YSMMeshLibrary.getMeshDir().resolve("tlm");
 
-    public record TlmMeshEntry(Meshes.MeshAccessor<YSMMesh> accessor, ResourceLocation texture) {}
+    public record TlmMeshEntry(String meshOwnerId, Meshes.MeshAccessor<YSMMesh> accessor,
+                               ResourceLocation texture) {}
 
     private static final Map<String, TlmMeshEntry> MESHES = new LinkedHashMap<>();
 
@@ -154,7 +155,7 @@ public final class TlmModelLibrary {
         if (entry != null) {
             // LRU touch: a model that is actually being drawn stays resident, so
             // the cache evicts the models the player has moved away from.
-            YSMMeshLibrary.touchModel(modelId);
+            YSMMeshLibrary.touchModel(entry.meshOwnerId());
         }
         return entry;
     }
@@ -163,6 +164,29 @@ public final class TlmModelLibrary {
     static Meshes.MeshAccessor<YSMMesh> accessorOf(String modelId) {
         TlmMeshEntry entry = MESHES.get(modelId);
         return entry != null ? entry.accessor() : null;
+    }
+
+    /** Extra-texture variants share their base model's mesh accessor and cache slot. */
+    static String meshOwnerOf(String modelId) {
+        TlmMeshEntry entry = MESHES.get(modelId);
+        return entry != null ? entry.meshOwnerId() : modelId;
+    }
+
+    /** Restore all texture ownership after an evicted shared mesh is loaded again. */
+    static void bindTexturesOfMesh(String meshOwnerId) {
+        for (TlmMeshEntry entry : MESHES.values()) {
+            if (meshOwnerId.equals(entry.meshOwnerId())) {
+                YSMMeshLibrary.bindModelTexture(meshOwnerId, entry.texture());
+            }
+        }
+    }
+
+    static void invalidateRuntimeModelsOfMesh(String meshOwnerId) {
+        for (Map.Entry<String, TlmMeshEntry> entry : MESHES.entrySet()) {
+            if (meshOwnerId.equals(entry.getValue().meshOwnerId())) {
+                com.ysmef.geomodel.model.runtime.YSMRuntimeModel.invalidate(entry.getKey());
+            }
+        }
     }
 
     /**
@@ -327,6 +351,7 @@ public final class TlmModelLibrary {
         if (Files.isDirectory(packFolder)) {
             try (var stream = Files.walk(packFolder, 1)) {
                 stream.filter(Files::isDirectory).skip(1)
+                        .filter(pack -> PackFileIO.isInsideReal(pack, packFolder))
                         .forEach(pack -> scanDiskPack(pack, built, converted, seen));
             } catch (Exception e) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to scan tlm_custom_pack: {}", e.toString());
@@ -338,8 +363,7 @@ public final class TlmModelLibrary {
             ResourceLocation manifestId = ResourceLocation.fromNamespaceAndPath(namespace, "maid_model.json");
             for (Resource resource : resourceManager.getResourceStack(manifestId)) {
                 try (InputStream in = resource.open()) {
-                    JsonObject packJson = JsonParser.parseString(
-                            new String(in.readAllBytes(), StandardCharsets.UTF_8)).getAsJsonObject();
+                    JsonObject packJson = JsonParser.parseString(PackFileIO.readString(in)).getAsJsonObject();
                     JsonArray modelList = packJson.getAsJsonArray("model_list");
                     if (modelList == null) continue;
                     for (JsonElement element : modelList) {
@@ -366,7 +390,9 @@ public final class TlmModelLibrary {
         // Queue every freshly registered model for the tick-driven prewarm, so the
         // first draw of a maid does not pay the mesh parse (see prewarmMeshes).
         PENDING_PREWARM.clear();
-        PENDING_PREWARM.addAll(built.keySet());
+        for (TlmMeshEntry entry : built.values()) {
+            PENDING_PREWARM.add(entry.meshOwnerId());
+        }
         // Drop generated textures no current model refers to (removed packs,
         // renamed models, and the doubled-extension files of earlier versions).
         YSMMeshLibrary.deleteStalePackTextures();
@@ -378,11 +404,11 @@ public final class TlmModelLibrary {
         if (!Files.isDirectory(assetsDir)) return;
         try (var nsStream = Files.list(assetsDir)) {
             nsStream.filter(Files::isDirectory).forEach(nsDir -> {
-                Path manifest = nsDir.resolve("maid_model.json");
-                if (!Files.isRegularFile(manifest)) return;
+                Path manifest = resolveInPackAssets(packRoot, nsDir.getFileName().toString(), "maid_model.json");
+                if (manifest == null) return;
                 try {
                     JsonObject packJson = JsonParser.parseString(
-                            Files.readString(manifest, StandardCharsets.UTF_8)).getAsJsonObject();
+                            PackFileIO.readString(manifest)).getAsJsonObject();
                     JsonArray modelList = packJson.getAsJsonArray("model_list");
                     if (modelList == null) return;
                     for (JsonElement element : modelList) {
@@ -427,12 +453,12 @@ public final class TlmModelLibrary {
             logRejectedPath("model", entry.get("model").getAsString());
             return false;
         }
-        Path modelFile = resolveInPackAssets(packRoot, namespace, modelRl.getPath());
-        if (modelFile == null || !Files.isRegularFile(modelFile)) return false;
+        Path modelFile = resolveInPackAssets(packRoot, modelRl);
+        if (modelFile == null) return false;
 
         YSMGeoModel geoModel;
         try {
-            String json = Files.readString(modelFile, StandardCharsets.UTF_8);
+            String json = PackFileIO.readString(modelFile);
             geoModel = isGecko ? YSMGeoModel.parse(json) : TlmGeoModelParser.parse(json);
         } catch (Exception e) {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to parse TLM model {} ({}): {}", modelId, modelFile, e.toString());
@@ -450,12 +476,12 @@ public final class TlmModelLibrary {
         if (texRl == null) {
             logRejectedPath("texture", entry.get("texture").getAsString());
         } else {
-            Path texFile = resolveInPackAssets(packRoot, texRl.getNamespace(), texRl.getPath());
-            if (texFile != null && Files.isRegularFile(texFile)) {
+            Path texFile = resolveInPackAssets(packRoot, texRl);
+            if (texFile != null) {
                 try {
                     ourTexture = YSMMeshLibrary.registerTextureBytes(
-                            "tlm/" + namespace + "/" + texRl.getPath(),
-                            Files.readAllBytes(texFile));
+                            "tlm/" + texRl.getNamespace() + "/" + texRl.getPath(),
+                            PackFileIO.readBytes(texFile));
                 } catch (Exception e) {
                     YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM texture {}: {}", texFile, e.toString());
                 }
@@ -474,14 +500,14 @@ public final class TlmModelLibrary {
                     logRejectedPath("extra_textures", elem.getAsString());
                     continue;
                 }
-                Path extraFile = resolveInPackAssets(packRoot, extraRl.getNamespace(), extraRl.getPath());
-                if (extraFile == null || !Files.isRegularFile(extraFile)) {
+                Path extraFile = resolveInPackAssets(packRoot, extraRl);
+                if (extraFile == null) {
                     continue;
                 }
                 try {
                     ResourceLocation registered = YSMMeshLibrary.registerTextureBytes(
                             "tlm/" + extraRl.getNamespace() + "/" + extraRl.getPath() + "_" + variantHash(extraRl),
-                            Files.readAllBytes(extraFile));
+                            PackFileIO.readBytes(extraFile));
                     extraTextures.put(modelId + "_" + variantHash(extraRl), registered);
                 } catch (Exception e) {
                     YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM extra texture {}: {}", extraRl, e.toString());
@@ -525,7 +551,7 @@ public final class TlmModelLibrary {
 
         YSMGeoModel geoModel;
         try (InputStream in = modelResource.get().open()) {
-            String json = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            String json = PackFileIO.readString(in);
             geoModel = isGecko ? YSMGeoModel.parse(json) : TlmGeoModelParser.parse(json);
         } catch (Exception e) {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to parse TLM model {} ({}): {}", modelId, modelRl, e.toString());
@@ -542,7 +568,7 @@ public final class TlmModelLibrary {
                 try (InputStream in = textureResource.get().open()) {
                     ourTexture = YSMMeshLibrary.registerTextureBytes(
                             "tlm/" + textureRl.getNamespace() + "/" + textureRl.getPath(),
-                            in.readAllBytes());
+                            PackFileIO.readBytes(in));
                 } catch (Exception e) {
                     YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM texture {}: {}", textureRl, e.toString());
                 }
@@ -566,7 +592,7 @@ public final class TlmModelLibrary {
                 try (InputStream in = extraResource.get().open()) {
                     ResourceLocation registered = YSMMeshLibrary.registerTextureBytes(
                             "tlm/" + texRl.getNamespace() + "/" + texRl.getPath() + "_" + variantHash(texRl),
-                            in.readAllBytes());
+                            PackFileIO.readBytes(in));
                     extraTextures.put(modelId + "_" + variantHash(texRl), registered);
                 } catch (Exception e) {
                     YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM extra texture {}: {}", texRl, e.toString());
@@ -637,11 +663,11 @@ public final class TlmModelLibrary {
         Meshes.MeshAccessor<YSMMesh> accessor = Meshes.MeshAccessor.create(
                 YSMGeoCompat.MODID, "entity/tlm/" + meshFile,
                 (loader) -> loader.loadSkinnedMesh(YSMMesh::new));
-        built.put(modelId, new TlmMeshEntry(accessor, ourTexture));
+        built.put(modelId, new TlmMeshEntry(modelId, accessor, ourTexture));
         YSMMeshLibrary.bindModelTexture(modelId, ourTexture);
         for (Map.Entry<String, ResourceLocation> variant : extraTextures.entrySet()) {
-            built.put(variant.getKey(), new TlmMeshEntry(accessor, variant.getValue()));
-            YSMMeshLibrary.bindModelTexture(variant.getKey(), variant.getValue());
+            built.put(variant.getKey(), new TlmMeshEntry(modelId, accessor, variant.getValue()));
+            YSMMeshLibrary.bindModelTexture(modelId, variant.getValue());
         }
         return true;
     }
@@ -667,12 +693,12 @@ public final class TlmModelLibrary {
                 logRejectedPath("animation", animElem.getAsString());
                 continue;
             }
-            Path animFile = resolveInPackAssets(packRoot, animRl.getNamespace(), animRl.getPath());
-            if (animFile == null || !Files.isRegularFile(animFile)) {
+            Path animFile = resolveInPackAssets(packRoot, animRl);
+            if (animFile == null) {
                 continue;
             }
             try {
-                mergeScriptAnims(JsonParser.parseString(Files.readString(animFile, StandardCharsets.UTF_8)).getAsJsonObject(), out);
+                mergeScriptAnims(JsonParser.parseString(PackFileIO.readString(animFile)).getAsJsonObject(), out);
             } catch (Exception e) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to parse TLM animation {}: {}", animRl, e.toString());
             }
@@ -698,7 +724,7 @@ public final class TlmModelLibrary {
                 continue;
             }
             try (InputStream in = resource.get().open()) {
-                String json = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+                String json = PackFileIO.readString(in);
                 mergeScriptAnims(JsonParser.parseString(json).getAsJsonObject(), out);
             } catch (Exception e) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to parse TLM animation {}: {}", animRl, e.toString());
@@ -765,12 +791,24 @@ public final class TlmModelLibrary {
         return true;
     }
 
-    /** Resolve an untrusted pack-relative path under {@code <packRoot>/assets}, or null when it escapes. */
+    static Path resolveInPackAssets(Path packRoot, ResourceLocation location) {
+        return location == null ? null
+                : resolveInPackAssets(packRoot, location.getNamespace(), location.getPath());
+    }
+
+    /** Resolve an existing pack file and reject links that leave the pack's assets tree. */
     private static Path resolveInPackAssets(Path packRoot, String namespace, String path) {
         if (namespace == null || path == null || namespace.equals(".") || namespace.equals("..")) {
             return null;
         }
-        return YSMMeshLibrary.resolveInside(packRoot.resolve("assets"), namespace + "/" + path);
+        Path assets = packRoot.resolve("assets");
+        Path file = YSMMeshLibrary.resolveInside(assets, namespace + "/" + path);
+        if (file == null || !Files.isRegularFile(file)
+                || !PackFileIO.isInsideReal(assets, packRoot)
+                || !PackFileIO.isInsideReal(file, assets)) {
+            return null;
+        }
+        return file;
     }
 
     /** Log a rejected model-pack path once per distinct value. */

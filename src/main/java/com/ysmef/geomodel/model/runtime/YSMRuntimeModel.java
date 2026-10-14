@@ -6,6 +6,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.ysmef.geomodel.YSMGeoCompat;
 import com.ysmef.geomodel.model.EFMeshJsonWriter;
+import com.ysmef.geomodel.model.PackFileIO;
 import com.ysmef.geomodel.model.YSMMesh;
 import com.ysmef.geomodel.model.YSMMeshLibrary;
 import com.ysmef.geomodel.ysm.script.Molang;
@@ -478,8 +479,8 @@ public final class YSMRuntimeModel {
 
     private static final Map<String, YSMRuntimeModel> CACHE = new HashMap<>();
 
-    /** Models whose runtime JSON is being compiled on a background thread. */
-    private static final Set<String> PRELOADING = ConcurrentHashMap.newKeySet();
+    /** Model -> in-flight compile ticket; invalidation revokes only that task. */
+    private static final Map<String, Object> PRELOADING = new ConcurrentHashMap<>();
 
     /** Incremented on invalidateAll: stale background compiles drop their results. */
     private static final java.util.concurrent.atomic.AtomicInteger RELOAD_GENERATION = new java.util.concurrent.atomic.AtomicInteger();
@@ -494,7 +495,7 @@ public final class YSMRuntimeModel {
      * cached for the session. (Previously the file mtime was re-read on every
      * call - a disk stat per player per frame.)
      *
-     * The compile normally runs on a background thread ({@link #preload(String)},
+     * The compile normally runs on a background thread ({@link #preloadAsync(String, java.util.concurrent.Executor)},
      * started when the mesh is registered); while it is in flight this returns
      * null so the render thread never blocks on the compile, and the caller
      * renders the un-evaluated fallback for a few frames instead of hitching.
@@ -504,11 +505,11 @@ public final class YSMRuntimeModel {
             if (CACHE.containsKey(modelId)) {
                 return CACHE.get(modelId);
             }
+            if (PRELOADING.containsKey(modelId) || isRetryBlocked(modelId)) {
+                return null;
+            }
+            return loadAndCache(modelId);
         }
-        if (PRELOADING.contains(modelId)) {
-            return null;
-        }
-        return loadAndCache(modelId);
     }
 
     /**
@@ -521,37 +522,73 @@ public final class YSMRuntimeModel {
      * task is still the current one (reloads/re-conversions drop stale results,
      * the next {@link #get} then compiles synchronously as the fallback).
      */
+    public static void preloadAsync(String modelId, java.util.concurrent.Executor executor) {
+        PreloadJob job = beginPreload(modelId);
+        if (job == null) {
+            return;
+        }
+        try {
+            executor.execute(() -> runPreload(modelId, job));
+        } catch (RuntimeException e) {
+            synchronized (CACHE) {
+                PRELOADING.remove(modelId, job.ticket());
+            }
+            throw e;
+        }
+    }
+
+    /** Synchronous entry retained for callers that already own a worker thread. */
     public static void preload(String modelId) {
+        PreloadJob job = beginPreload(modelId);
+        if (job != null) {
+            runPreload(modelId, job);
+        }
+    }
+
+    private record PreloadJob(Object ticket, int generation) {}
+
+    private static PreloadJob beginPreload(String modelId) {
+        Object ticket = new Object();
         synchronized (CACHE) {
-            if (CACHE.containsKey(modelId)) {
+            if (CACHE.containsKey(modelId) || isRetryBlocked(modelId)
+                    || PRELOADING.putIfAbsent(modelId, ticket) != null) {
+                return null;
+            }
+            return new PreloadJob(ticket, RELOAD_GENERATION.get());
+        }
+    }
+
+    private static void runPreload(String modelId, PreloadJob job) {
+        synchronized (CACHE) {
+            if (PRELOADING.get(modelId) != job.ticket()
+                    || job.generation() != RELOAD_GENERATION.get()) {
                 return;
             }
         }
-        if (isRetryBlocked(modelId)) {
-            return;
-        }
-        if (!PRELOADING.add(modelId)) {
-            return;
-        }
-        int generation = RELOAD_GENERATION.get();
         try {
             YSMRuntimeModel model = loadAndCompile(modelId);
-            if (PRELOADING.remove(modelId) && generation == RELOAD_GENERATION.get()) {
-                synchronized (CACHE) {
+            synchronized (CACHE) {
+                if (PRELOADING.remove(modelId, job.ticket())
+                        && job.generation() == RELOAD_GENERATION.get()) {
                     if (model != null) {
                         CACHE.put(modelId, model);
                         FAILED_UNTIL.remove(modelId);
+                    } else {
+                        FAILED_UNTIL.put(modelId, System.nanoTime() + LOAD_FAILURE_BACKOFF_NANOS);
                     }
                 }
             }
         } catch (Throwable t) {
-            // Was completely silent: a preload that died from an Error (SOE, OOM)
-            // left the model uncached with no trace at all.
-            PRELOADING.remove(modelId);
-            if (FAILED_UNTIL.put(modelId, System.nanoTime() + LOAD_FAILURE_BACKOFF_NANOS) == null) {
-                YSMGeoCompat.LOGGER.warn(
-                        "YSM-GEO Compat: preload of runtime model '{}' failed, retrying in {}s",
-                        modelId, LOAD_FAILURE_BACKOFF_NANOS / 1_000_000_000L, t);
+            boolean current;
+            synchronized (CACHE) {
+                current = PRELOADING.remove(modelId, job.ticket())
+                        && job.generation() == RELOAD_GENERATION.get();
+                if (current) {
+                    FAILED_UNTIL.put(modelId, System.nanoTime() + LOAD_FAILURE_BACKOFF_NANOS);
+                }
+            }
+            if (current) {
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: preload of runtime model '{}' failed", modelId, t);
             }
         }
     }
@@ -583,6 +620,9 @@ public final class YSMRuntimeModel {
             if (CACHE.containsKey(modelId)) {
                 return CACHE.get(modelId);
             }
+            if (PRELOADING.containsKey(modelId) || isRetryBlocked(modelId)) {
+                return null;
+            }
             YSMRuntimeModel model = loadAndCompile(modelId);
             if (model == null) {
                 // never poison the cache with a null entry (see FAILED_UNTIL)
@@ -598,7 +638,10 @@ public final class YSMRuntimeModel {
     private static YSMRuntimeModel loadAndCompile(String modelId) {
         Path file = runtimeFileOf(modelId);
         try {
-            String json = Files.readString(file);
+            if (!PackFileIO.isInsideReal(file, YSMMeshLibrary.getPackRoot())) {
+                throw new java.io.IOException("runtime model path leaves the generated pack");
+            }
+            String json = PackFileIO.readString(file);
             return compile(modelId, JsonParser.parseString(json).getAsJsonObject());
         } catch (Exception e) {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to load runtime model '{}': {}", modelId, e.toString());
@@ -610,18 +653,19 @@ public final class YSMRuntimeModel {
     public static void invalidate(String modelId) {
         synchronized (CACHE) {
             CACHE.remove(modelId);
+            PRELOADING.remove(modelId);
+            FAILED_UNTIL.remove(modelId);
         }
-        PRELOADING.remove(modelId);
-        FAILED_UNTIL.remove(modelId);
     }
 
     /** Forget all cached runtime models (called when meshes are regenerated). */
     public static void invalidateAll() {
         synchronized (CACHE) {
+            RELOAD_GENERATION.incrementAndGet();
             CACHE.clear();
+            PRELOADING.clear();
+            FAILED_UNTIL.clear();
         }
-        PRELOADING.clear();
-        RELOAD_GENERATION.incrementAndGet();
     }
 
     /**

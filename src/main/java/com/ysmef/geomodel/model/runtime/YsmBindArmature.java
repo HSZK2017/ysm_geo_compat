@@ -60,8 +60,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * - Leg_R/L: top of the lower-leg geometry (the knee).
  * - Shoulder_R/L follow Arm_R/L, Elbow_R/L and Knee_R/L follow Hand_R/L and
  *   Leg_R/L (the duplicated joints of the reference armature).
- * - Tool_R/L: top of the hand-bone geometry (the wrist) when a separately
- *   named hand bone exists, otherwise the Hand_R/L elbow pivot.
+ * - Tool_R/L: centroid of the hand geometry (the palm), falling back to the
+ *   distal forearm geometry, then the wrist or elbow.
  *
  * All positions are read from the RUNTIME mesh: Epic Fight's JsonAssetLoader
  * applies the Blender-to-Minecraft rotation (BLENDER_TO_MINECRAFT_COORD, -90 deg
@@ -219,6 +219,8 @@ public final class YsmBindArmature {
     private static final Set<String> HAND_BONE_NAMES = new HashSet<>(List.of(
             "righthand", "handright", "lefthand", "handleft"));
 
+    private static final String[] HAND_NAME_PARTS = {"hand", "shou", "zhi", "finger", "fist", "palm"};
+
     /**
      * Directly-mapped accessory bones whose geometry extends far beyond the body
      * (a cape/wing reaches above the head, a backpack sits behind/above the
@@ -329,6 +331,9 @@ public final class YsmBindArmature {
             elbowL = midpoint(shoulderL, bottomOf(geometryOf(byJoint, JOINT_ARM_L)));
         }
 
+        Vector3f palmR = geometricPalm(runtime.bones, byBone, JOINT_HAND_R, elbowR);
+        Vector3f palmL = geometricPalm(runtime.bones, byBone, JOINT_HAND_L, elbowL);
+
         Map<Integer, OpenMatrix4f> pivots = new HashMap<>();
         putPivot(pivots, JOINT_ROOT, hip);
         putPivot(pivots, JOINT_TORSO, hip);
@@ -348,15 +353,15 @@ public final class YsmBindArmature {
         putPivot(pivots, JOINT_SHOULDER_L, shoulderL);
         putPivot(pivots, JOINT_ELBOW_R, elbowR);
         putPivot(pivots, JOINT_ELBOW_L, elbowL);
-        putPivot(pivots, JOINT_TOOL_R, wristR != null ? wristR : elbowR);
-        putPivot(pivots, JOINT_TOOL_L, wristL != null ? wristL : elbowL);
+        putPivot(pivots, JOINT_TOOL_R, palmR != null ? palmR : (wristR != null ? wristR : elbowR));
+        putPivot(pivots, JOINT_TOOL_L, palmL != null ? palmL : (wristL != null ? wristL : elbowL));
 
         if (BIND_PIVOT_LOG_LOGGED.add(modelId)) {
             YSMGeoCompat.LOGGER.info(
-                    "YSM-GEO Compat: [bind] model='{}' pivots root={},torso={},chest={},head={},shoulderR={},shoulderL={},elbowR={},elbowL={},wristR={},wristL={}",
+                    "YSM-GEO Compat: [bind] model='{}' pivots root={},torso={},chest={},head={},shoulderR={},shoulderL={},elbowR={},elbowL={},wristR={},wristL={},palmR={},palmL={}",
                     modelId,
                     fmt(hip), fmt(hip), fmt(chest), fmt(neck), fmt(shoulderR), fmt(shoulderL),
-                    fmt(elbowR), fmt(elbowL), fmt(wristR), fmt(wristL));
+                    fmt(elbowR), fmt(elbowL), fmt(wristR), fmt(wristL), fmt(palmR), fmt(palmL));
         }
 
         Map<String, Joint> jointMap = new HashMap<>();
@@ -674,6 +679,99 @@ public final class YsmBindArmature {
             }
         }
         return null;
+    }
+
+    /** Use the visible hand's centroid as the item grip, not its proximal wrist. */
+    static Vector3f geometricPalm(YSMRuntimeModel.BoneRt[] bones, Map<Integer, List<Vector3f>> byBone,
+                                  int joint, Vector3f elbow) {
+        Vector3f handCenter = handRegionCentroid(bones, byBone, joint);
+        if (handCenter != null) {
+            return handCenter;
+        }
+        if (elbow == null) {
+            return null;
+        }
+        // An accessory with an opaque name can dominate the forearm geometry.
+        // Prefer geometry explicitly mapped to this joint before inferred bones.
+        Vector3f mapped = farHalfCentroid(bones, byBone, joint, elbow, true);
+        return mapped != null ? mapped : farHalfCentroid(bones, byBone, joint, elbow, false);
+    }
+
+    private static Vector3f handRegionCentroid(YSMRuntimeModel.BoneRt[] bones,
+                                               Map<Integer, List<Vector3f>> byBone, int joint) {
+        Vector3f sum = new Vector3f();
+        int count = 0;
+        for (Map.Entry<Integer, List<Vector3f>> entry : byBone.entrySet()) {
+            YSMRuntimeModel.BoneRt bone = bones[entry.getKey()];
+            if (bone.joint != joint) {
+                continue;
+            }
+            String name = normalize(bone.name);
+            if (isWeaponBone(name) || !isHandBone(name)) {
+                continue;
+            }
+            for (Vector3f vertex : entry.getValue()) {
+                sum.add(vertex);
+                count++;
+            }
+        }
+        return count == 0 ? null : sum.div(count);
+    }
+
+    private static Vector3f farHalfCentroid(YSMRuntimeModel.BoneRt[] bones,
+                                            Map<Integer, List<Vector3f>> byBone,
+                                            int joint, Vector3f elbow, boolean mappedOnly) {
+        Map<Integer, Float> distances = new HashMap<>();
+        float farthest = 0.0f;
+        for (Map.Entry<Integer, List<Vector3f>> entry : byBone.entrySet()) {
+            YSMRuntimeModel.BoneRt bone = bones[entry.getKey()];
+            if (bone.joint != joint || (mappedOnly && !bone.mapped)
+                    || isWeaponBone(normalize(bone.name))) {
+                continue;
+            }
+            Vector3f center = centroidOf(entry.getValue());
+            if (center != null) {
+                float distance = center.distance(elbow);
+                distances.put(entry.getKey(), distance);
+                farthest = Math.max(farthest, distance);
+            }
+        }
+        if (farthest <= 0.0f) {
+            return null;
+        }
+        Vector3f sum = new Vector3f();
+        int count = 0;
+        for (Map.Entry<Integer, List<Vector3f>> entry : byBone.entrySet()) {
+            Float distance = distances.get(entry.getKey());
+            if (distance == null || distance < farthest * 0.5f) {
+                continue;
+            }
+            for (Vector3f vertex : entry.getValue()) {
+                sum.add(vertex);
+                count++;
+            }
+        }
+        return count == 0 ? null : sum.div(count);
+    }
+
+    private static boolean isHandBone(String name) {
+        for (String part : HAND_NAME_PARTS) {
+            if (name.contains(part)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Vector3f centroidOf(List<Vector3f> vertices) {
+        if (vertices == null || vertices.isEmpty()) {
+            return null;
+        }
+        Vector3f sum = new Vector3f();
+        for (Vector3f vertex : vertices) {
+            sum.add(vertex);
+        }
+        return sum.div(vertices.size());
     }
 
     /**

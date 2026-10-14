@@ -168,6 +168,10 @@ public class YSMMesh extends HumanoidMesh {
                     yesman.epicfight.model.armature.HumanoidArmature bind = YsmBindArmature.getArmature(this.runtimeModelId, this);
                     if (bind != null) {
                         bind.setPose(captured);
+                        // EF passes its original pose array to the later item layer.
+                        // Keep this draw's model-sized palm matrices for that layer.
+                        com.ysmef.geomodel.renderer.layer.YsmWeaponPoseBridge.capture(
+                                renderEntity, armature, poses, bind);
                         armature = bind;
                         poses = bind.getPoseMatrices();
                         rebindApplied = true;

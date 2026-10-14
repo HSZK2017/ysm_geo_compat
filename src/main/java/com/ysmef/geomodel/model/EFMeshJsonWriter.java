@@ -11,7 +11,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.*;
 
 /**
@@ -94,7 +93,7 @@ public class EFMeshJsonWriter {
 
         int[] quadCount = {0};
         for (YSMGeoModel.Bone rootBone : geoModel.topLevelBones) {
-            walkBone(rootBone, new Matrix4f(), scaleW, scaleH, dedup,
+            walkBone(geoModel, rootBone, new Matrix4f(), scaleW, scaleH, dedup,
                     positions, normals, uvs, vcounts, vindices, partIndices, quadCount, 0);
         }
 
@@ -168,7 +167,7 @@ public class EFMeshJsonWriter {
             rot.add(bone.rotY);
             rot.add(bone.rotZ);
             obj.add("rot", rot);
-            obj.addProperty("joint", YSMJointMapper.resolveJointId(bone));
+            obj.addProperty("joint", bakedJointId(bone, geoModel));
             obj.addProperty("mapped", YSMJointMapper.isDirectlyMapped(bone));
             bones.add(obj);
         }
@@ -186,21 +185,15 @@ public class EFMeshJsonWriter {
      * resource reload or cache scan can never observe a half-written file.
      */
     static void writeFileAtomic(Path target, byte[] bytes) throws IOException {
-        Files.createDirectories(target.getParent());
-        Path tmp = target.resolveSibling(target.getFileName().toString() + ".tmp");
-        Files.write(tmp, bytes);
-        try {
-            Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        } catch (java.nio.file.AtomicMoveNotSupportedException ignored) {
-            Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
-        }
+        PackFileIO.writeAtomically(target, YSMMeshLibrary.getPackRoot(), tmp -> Files.write(tmp, bytes));
     }
 
     /**
      * Recursively walks a bone, applying the bind-pose transform chain and
      * emitting all quad vertices in Epic Fight's Blender-space convention.
      */
-    private static void walkBone(YSMGeoModel.Bone bone, Matrix4f parentTransform, float scaleW, float scaleH,
+    private static void walkBone(YSMGeoModel geoModel, YSMGeoModel.Bone bone,
+                                 Matrix4f parentTransform, float scaleW, float scaleH,
                                  Map<VertexKey, Integer> dedup,
                                  List<Float> positions, List<Float> normals, List<Float> uvs,
                                  List<Integer> vcounts, List<Integer> vindices,
@@ -230,7 +223,7 @@ public class EFMeshJsonWriter {
         boneTransform.translate(-bone.pivotX, -bone.pivotY, -bone.pivotZ);
 
         if (!bone.quads.isEmpty()) {
-            int jointId = YSMJointMapper.resolveJointId(bone);
+            int jointId = bakedJointId(bone, geoModel);
             List<Integer> partList = partIndices.computeIfAbsent(partNameOf(bone), k -> new ArrayList<>());
 
             for (YSMGeoModel.Quad quad : bone.quads) {
@@ -282,7 +275,7 @@ public class EFMeshJsonWriter {
         }
 
         for (YSMGeoModel.Bone child : bone.children) {
-            walkBone(child, boneTransform, scaleW, scaleH, dedup,
+            walkBone(geoModel, child, boneTransform, scaleW, scaleH, dedup,
                     positions, normals, uvs, vcounts, vindices, partIndices, quadCount, depth + 1);
         }
     }
@@ -290,6 +283,11 @@ public class EFMeshJsonWriter {
     /** The Epic Fight part name carrying the geometry of the given YSM bone. */
     public static String partNameOf(YSMGeoModel.Bone bone) {
         return BONE_PART_PREFIX + bone.name;
+    }
+
+    /** The mesh vertex and runtime bone table must use the same geometry-aware joint. */
+    static int bakedJointId(YSMGeoModel.Bone bone, YSMGeoModel model) {
+        return YSMJointMapper.resolveJointId(bone, model);
     }
 
     /**
