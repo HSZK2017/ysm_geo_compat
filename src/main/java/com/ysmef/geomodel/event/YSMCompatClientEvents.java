@@ -1,9 +1,11 @@
 package com.ysmef.geomodel.event;
 
 import com.ysmef.geomodel.YSMGeoCompat;
+import com.ysmef.geomodel.env.EnvironmentCheck;
 import com.ysmef.geomodel.model.TlmModelLibrary;
 import com.ysmef.geomodel.model.YSMMeshLibrary;
 import com.ysmef.geomodel.model.runtime.YSMRuntimeModel;
+import com.ysmef.geomodel.network.TlmPackClient;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.packs.PackType;
@@ -64,7 +66,9 @@ public class YSMCompatClientEvents {
      */
     @SubscribeEvent
     public static void onClientSetup(FMLClientSetupEvent event) {
+        EnvironmentCheck.reportHost();
         event.enqueueWork(() -> {
+            EnvironmentCheck.reportGlContext();
             // Load the direct draw paths so they self-register (see RenderPaths).
             com.ysmef.geomodel.renderer.RenderPaths.init();
             try {
@@ -82,6 +86,13 @@ public class YSMCompatClientEvents {
     @SubscribeEvent
     public static void onRegisterReloadListeners(RegisterClientReloadListenersEvent event) {
         event.registerReloadListener((ResourceManagerReloadListener) resourceManager -> {
+            regenerateMeshes(resourceManager);
+            TlmPackClient.onResourceReload();
+        });
+    }
+
+    /** Render-thread rebuild used by F3+T and by a server pack becoming active or disconnecting. */
+    public static void regenerateMeshes(net.minecraft.server.packs.resources.ResourceManager resourceManager) {
             YSMRuntimeModel.invalidateAll();
             YSMRuntimeModel.clearAnimators();
             // Drop every re-bound bind armature and captured pose of the model-part
@@ -103,6 +114,5 @@ public class YSMCompatClientEvents {
             } catch (Throwable t) {
                 YSMGeoCompat.LOGGER.error("YSM-GEO Compat: TLM mesh regeneration failed", t);
             }
-        });
     }
 }

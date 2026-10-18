@@ -3,7 +3,9 @@ package com.ysmef.geomodel.mixin.eftlm;
 import com.github.tartaricacid.touhoulittlemaid.entity.passive.EntityMaid;
 import com.ysmef.geomodel.YSMGeoCompat;
 import com.ysmef.geomodel.eftlm.YsmMaidMeshSupport;
+import com.ysmef.geomodel.eftlm.TlmMissingMeshDiagnosis;
 import com.ysmef.geomodel.model.TlmModelLibrary;
+import com.ysmef.geomodel.network.TlmPackClient;
 import com.ysmef.geomodel.renderer.layer.YsmAnchoredItemLayer;
 import net.EFTLM.EF.Capability.MaidPatch;
 import net.EFTLM.EF.Model.EFTLM_Meshes;
@@ -82,6 +84,9 @@ public abstract class YsmMaidRendererMixin {
                     "YSM-yield (YSM_EpicFight_Compat)", displayName);
             return;
         }
+        // The TLM pack supplies the ordinary maid model even when EFTLM already
+        // has a tuned Epic Fight mesh for this id. Query it before mesh selection.
+        TlmPackClient.requestIfNeeded(maid.getModelId());
         // EFTLM ships its own tuned mesh for this model id (keyed by the
         // namespace-stripped id, see MaidPatch#getModelID): prefer it.
         Meshes.MeshAccessor<MaidMesh> eftlmMesh = EFTLM_Meshes.getMesh(modelId);
@@ -105,7 +110,16 @@ public abstract class YsmMaidRendererMixin {
             AssetAccessor<MaidMesh> result = (AssetAccessor<MaidMesh>) (AssetAccessor<?>) mesh;
             cir.setReturnValue(result);
         } else {
-            logMeshSourceOnce(modelId, "missing (EFTLM default mesh)", displayName);
+            String fullId = maid.getModelId();
+            TlmPackClient.Resolution transfer = TlmPackClient.resolution(fullId);
+            String reason = TlmMissingMeshDiagnosis.explain(
+                    transfer.pending(), transfer.sourceKnown(), transfer.unavailableReason(),
+                    TlmModelLibrary.conversionFailure(fullId), TlmModelLibrary.unreadablePacks());
+            if (reason != null && LOGGED_SOURCES.add("missing|" + fullId + "|" + reason)) {
+                YSMGeoCompat.LOGGER.warn(
+                        "YSM-GEO Compat: maid '{}' (model '{}') uses EFTLM's default mesh: {}",
+                        displayName, fullId, reason);
+            }
         }
     }
 

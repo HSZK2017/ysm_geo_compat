@@ -3,6 +3,8 @@ package com.ysmef.geomodel.event;
 import com.ysmef.geomodel.YSMGeoCompat;
 import com.ysmef.geomodel.model.TlmModelLibrary;
 import com.ysmef.geomodel.model.YSMMeshLibrary;
+import com.ysmef.geomodel.network.TlmPackClient;
+import net.minecraftforge.client.event.ClientPlayerNetworkEvent;
 import net.minecraftforge.api.distmarker.Dist;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
@@ -44,6 +46,7 @@ public final class YSMGeoClientTickHandler {
             return;
         }
         try {
+            TlmPackClient.tick();
             YSMMeshLibrary.tick();
             TlmModelLibrary.prewarmMeshes();
         } catch (Throwable t) {
@@ -51,5 +54,10 @@ public final class YSMGeoClientTickHandler {
             // would flood the log; the deferred work is best-effort anyway.
             YSMGeoCompat.LOGGER.error("YSM-GEO Compat: client tick maintenance failed", t);
         }
+    }
+
+    @SubscribeEvent
+    public static void onDisconnect(ClientPlayerNetworkEvent.LoggingOut event) {
+        TlmPackClient.clear();
     }
 }

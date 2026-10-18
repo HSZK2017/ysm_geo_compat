@@ -1,6 +1,7 @@
 package com.ysmef.geomodel;
 
 import com.ysmef.geomodel.config.YSMCompatConfig;
+import com.ysmef.geomodel.network.TlmPackNetwork;
 import com.ysmef.geomodel.ysm.script.Molang;
 import net.minecraftforge.fml.common.Mod;
 import org.apache.logging.log4j.LogManager;
@@ -17,6 +18,7 @@ public class YSMGeoCompat {
 
     public YSMGeoCompat() {
         YSMCompatConfig.register();
+        TlmPackNetwork.init();
         installMolangErrorReporter();
         LOGGER.info("YSM-GEO Compat: Initialized successfully");
     }

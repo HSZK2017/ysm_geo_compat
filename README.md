@@ -7,6 +7,7 @@
 | 项目 | 值 |
 |---|---|
 | Mod ID | `ysm_geo_compat` |
+| 当前版本 | `1.1.1` |
 | Minecraft | 1.20.1（Forge `[47,)`） |
 | 必装依赖 | Epic Fight `[20.14,)`（与 EpicFight_TouhouLittleMaid 自身区间保持一致，原因见下） |
 | 可选依赖 | Touhou Little Maid `[1.5,)`、EpicFight_TouhouLittleMaid `[1.1,)`、YSM_EpicFight_Compat（YSM 女仆支持） |
@@ -22,8 +23,10 @@
 
 ## 功能特性
 
-- **GEO 模型 → Epic Fight 网格**：将 TLM 模型包（`tlm_custom_pack` 目录包与 jar 内置 `maid_model.json` 条目，含 GeckoLib 模型）转换为 Epic Fight `animmodels` 网格 JSON。
+- **GEO 模型 → Epic Fight 网格**：将 TLM 模型包（`tlm_custom_pack` 目录包、ZIP 包与 jar 内置 `maid_model.json` 条目，含 GeckoLib 模型）转换为 Epic Fight `animmodels` 网格 JSON。
 - **女仆支持**：通过可选 mixin 钩住 EpicFight_TouhouLittleMaid 的 `PatchedLivingMaidRenderer`，女仆的 TLM 模型替换为转换网格；支持 `extra_textures` 变体（hash 变体 id）与 `show_backpack` 配置。
+- **服务器模型包同步**：联机时按非 YSM 女仆的模型 ID 查询服务器的 TLM 包（包括 EFTLM 已有内置战斗网格的模型），仅在版本哈希不同且本地没有相同包时下载；下载请求在客户端限流排队，已见模型每约 60 秒复查版本，F3+T 后安排立即复查。服务端只打包女仆几何、PNG 贴图和 Gecko JSON 动画，椅子与音效等无关资源不计入传输大小；客户端按服务器 ID 缓存并校验哈希、ZIP 路径及解压大小，断线后撤销本次连接的模型覆盖。远端 JavaScript 动画不会执行。
+- **故障诊断**：启动日志提示 JVM 内存、Android 启动器和图形驱动的兼容风险；女仆回退到 EFTLM 默认网格时，日志区分模型包缺失、包无法扫描、转换失败与服务器传输状态。环境诊断可用 `-Dysm_geo_compat.disable_env_check=true` 关闭。
 - **运行时变体控制**：解析模型包的 bedrock molang 动画脚本（平行脚本/状态动画/条件动画），在战斗中只显示默认形态（低血狐狸、魔法阵、枪械、背包等变体正确隐藏），空闲时按真实实体状态（血量/手持物品）动态切换。
 - **外部模组联动动画过滤**：`iss:*`（Iron's Spells）、`tac:*`（TAC 枪械）等与第三方模组联动的动画被自动排除，其变体骨骼按平行脚本保持默认隐藏。
 - **两条直接蒙皮渲染路径**：
@@ -55,6 +58,8 @@ com.ysmef.geomodel
 │   ├── RenderBridgeRegistry    # 绘制分派接口（GpuSkinRender / CpuSkinRender）
 │   ├── TlmGeoModelParser       # TLM 非 gecko 女仆模型的几何解析
 │   ├── TlmModelLibrary         # TLM 模型包扫描/转换、动画文件→运行时、变体、show_backpack
+│   ├── TlmPackArchive/Zip      # 目录包与 ZIP 包统一读取、路径和大小校验
+│   ├── TlmServerOverlay        # 联机包覆盖及断线清理
 │   ├── YSMJointMapper          # 骨骼名 → EF biped 关节 id（含唯一 normalizeBoneName）
 │   ├── YSMMesh                 # 网格子类：贴图覆盖、逐帧运行时变换、姿势裁剪、路径分派
 │   ├── YSMMeshLibrary          # 生成包路径/sanitize+resolveInside 围栏/贴图注册与上传/预编译池
@@ -73,6 +78,9 @@ com.ysmef.geomodel
 │                               #   / YsmGpuCapability / YsmGpuRenderEnable / GpuShaderUtil
 ├── eftlm/
 │   └── YsmMaidMeshSupport      # 女仆 TLM 模型网格选择桥（YSM 女仆让位给 YSMEF）
+├── env/EnvironmentCheck        # 运行环境兼容诊断
+├── network/                    # 模型版本查询、分块传输、下载队列和定期复查
+├── tlm/TlmClientPackBridge     # 服务端模型包接入客户端转换流程
 └── mixin/
     ├── RenderSystemAccessorMixin / SkinnedMeshCpuRenderMixin / YsmArmaturePoseMixin
     ├── YsmGeoMixinPlugin       # 可选 YSM 守卫的开关插件（装了 YSMEF 时禁用）
@@ -92,7 +100,7 @@ com.ysmef.geomodel
 启动
  ├─ FMLClientSetupEvent ── RenderPaths.init()（触发两条路径自注册 + 着色器预编译）
  │                       └─ TlmModelLibrary.generateAll()（渲染线程 + Semaphore(2)）
- │                             └─ 扫描 tlm_custom_pack + jar 内置 maid_model.json
+ │                             └─ 扫描 tlm_custom_pack 目录包/ZIP 包 + jar 内置 maid_model.json
  │                                   └─ 每条目：几何 → 网格 JSON；动画文件 → 过滤 → 运行时 JSON
  └─ AddPackFindersEvent ── 注册 config/ysm_geo_compat/resourcepack 为客户端资源包
 
@@ -145,7 +153,7 @@ config/ysm_geo_compat/
 要求：JDK 17+（Gradle 运行使用 JDK 21，见 `gradle.properties`）。
 
 ```bash
-./gradlew build     # 产物：build/libs/YSM_GEO_Compat-1.20.1-1.1.0.jar（无内嵌库，无 -all 变体）
+./gradlew build     # 产物：build/libs/YSM_GEO_Compat-1.20.1-1.1.1.jar（无内嵌库，无 -all 变体）
 ./gradlew test      # 单元测试（molang 求值/路径围栏/关节表与骨名归一化）
 ```
 
@@ -155,7 +163,7 @@ config/ysm_geo_compat/
 
 ## 安装
 
-1. 将 `YSM_GEO_Compat-1.20.1-1.1.0.jar` 放入 `mods/`。
+1. 将 `YSM_GEO_Compat-1.20.1-1.1.1.jar` 放入 `mods/`。
 2. 必装 Epic Fight；女仆支持需 Touhou Little Maid + EpicFight_TouhouLittleMaid。
 3. 需要玩家 YSM 模型或 YSM 女仆时，同时安装 YSM_EpicFight_Compat（本模组与其共存时仅处理 TLM 模型）。
 
@@ -164,6 +172,7 @@ config/ysm_geo_compat/
 - 女仆：选用 TLM 模型包的模型即自动生效；`extra_textures` 变体纹理也会按 TLM 的 hash 变体 id 匹配。使用 YSM 模型的女仆由 YSM_EpicFight_Compat 渲染。
 - 战斗中（EF 接管渲染）显示默认形态；空闲时 molang 驱动的变体（低血狐狸、手持御币魔法阵等）正常切换。
 - 模型文件变更后按 `F3+T` 触发重新转换（贴图与运行时脚本一并失效重载）。
+- 联机服务器若安装本模组并将 TLM 包放在 `tlm_custom_pack`，客户端可自动获取当前女仆使用的包；服务器没有对应包或同步通道时继续使用本地模型及原有渲染回退。下载缓存位于 `config/ysm_geo_compat/server_models/<服务器 ID>`，不会写入 `tlm_custom_pack`。
 
 ## 配置
 
@@ -174,6 +183,9 @@ config/ysm_geo_compat/
 - `lazyModelCacheSize`：常驻女仆网格数上限（默认 64，范围 8–512；共享网格的额外贴图变体只计一次）。超出时按 LRU 释放网格与贴图，
   该模型下次被绘制时由 Epic Fight 从生成的网格 JSON 重新加载（不重转换、不会永久失效；
   贴图从生成资源包文件重新读取）。
+- `downloadServerModels`：允许下载服务器的 TLM 模型包，默认开；`maxDownloadedModelSizeMiB`：单包压缩大小上限，默认 64 MiB。
+
+服务器配置 `<世界目录>/serverconfig/ysm_geo_compat-server.toml`：`modelTransferEnabled` 默认开，`maxModelSizeMiB` 默认 64 MiB，`transferKiBPerTick` 默认每玩家每 tick 64 KiB，`maxConcurrentTransfers` 默认 2。
 
 转换与生命周期说明：
 

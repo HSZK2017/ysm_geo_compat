@@ -17,6 +17,7 @@ public class YSMCompatConfig {
     public static final boolean DIAG = Boolean.getBoolean("ysm_geo_compat.diag");
 
     public static final ForgeConfigSpec CLIENT_SPEC;
+    public static final ForgeConfigSpec SERVER_SPEC;
 
     /**
      * ModernYSM-style GPU skinning: draw converted TLM meshes with a bone SSBO
@@ -36,6 +37,12 @@ public class YSMCompatConfig {
      * generated mesh JSON on its next draw, so nothing is re-converted.
      */
     public static final ForgeConfigSpec.IntValue LAZY_MODEL_CACHE_SIZE;
+    public static final ForgeConfigSpec.BooleanValue DOWNLOAD_SERVER_MODELS;
+    public static final ForgeConfigSpec.IntValue MAX_DOWNLOADED_MODEL_MIB;
+    public static final ForgeConfigSpec.BooleanValue MODEL_TRANSFER_ENABLED;
+    public static final ForgeConfigSpec.IntValue MODEL_TRANSFER_MAX_MODEL_MIB;
+    public static final ForgeConfigSpec.IntValue MODEL_TRANSFER_KIB_PER_TICK;
+    public static final ForgeConfigSpec.IntValue MODEL_TRANSFER_MAX_CONCURRENT;
 
     static {
         ForgeConfigSpec.Builder builder = new ForgeConfigSpec.Builder();
@@ -63,13 +70,31 @@ public class YSMCompatConfig {
                         "a normal session can meet at once; raise it to keep whole large packs resident.")
                 .defineInRange("lazyModelCacheSize", 64, 8, 512);
 
+        DOWNLOAD_SERVER_MODELS = builder
+                .comment("Download TLM model packs offered by a server running YSM GEO Compat.",
+                        "Copies stay in this mod's per-server cache, not in tlm_custom_pack.")
+                .define("downloadServerModels", true);
+        MAX_DOWNLOADED_MODEL_MIB = builder
+                .comment("Maximum compressed size of one downloaded TLM pack in MiB.")
+                .defineInRange("maxDownloadedModelSizeMiB", 64, 1, 256);
+
         builder.pop();
 
         CLIENT_SPEC = builder.build();
+
+        ForgeConfigSpec.Builder server = new ForgeConfigSpec.Builder();
+        server.comment("YSM GEO Compat - Server Model Transfer").push("server");
+        MODEL_TRANSFER_ENABLED = server.define("modelTransferEnabled", true);
+        MODEL_TRANSFER_MAX_MODEL_MIB = server.defineInRange("maxModelSizeMiB", 64, 1, 256);
+        MODEL_TRANSFER_KIB_PER_TICK = server.defineInRange("transferKiBPerTick", 64, 1, 512);
+        MODEL_TRANSFER_MAX_CONCURRENT = server.defineInRange("maxConcurrentTransfers", 2, 1, 8);
+        server.pop();
+        SERVER_SPEC = server.build();
     }
 
     @SuppressWarnings("removal")
     public static void register() {
         ModLoadingContext.get().registerConfig(ModConfig.Type.CLIENT, CLIENT_SPEC);
+        ModLoadingContext.get().registerConfig(ModConfig.Type.SERVER, SERVER_SPEC);
     }
 }

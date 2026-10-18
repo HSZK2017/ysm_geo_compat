@@ -13,6 +13,7 @@ import net.minecraft.server.packs.resources.Resource;
 import net.minecraft.server.packs.resources.ResourceManager;
 import yesman.epicfight.api.client.model.Meshes;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -21,14 +22,15 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.zip.ZipFile;
 
 /**
  * Registry of converted Epic Fight base meshes for Touhou Little Maid GEO models.
  *
  * TLM loads model packs from the tlm_custom_pack folder by direct file IO (not
- * the MC ResourceManager). This class replicates that: it walks every folder
- * pack under tlm_custom_pack, reads maid_model.json + model JSONs + texture PNGs
- * from disk, converts them to EF mesh JSONs, and registers textures. Jar-builtin
+ * the MC ResourceManager). This class replicates that: it reads folder and ZIP
+ * packs under tlm_custom_pack, converts their model JSONs to EF meshes, and
+ * registers textures. Jar-builtin
  * TLM models (inside the TLM mod jar) are additionally fetched via the
  * ResourceManager.
  */
@@ -40,6 +42,8 @@ public final class TlmModelLibrary {
                                ResourceLocation texture) {}
 
     private static final Map<String, TlmMeshEntry> MESHES = new LinkedHashMap<>();
+    private static final Map<String, String> CONVERSION_FAILURES = new LinkedHashMap<>();
+    private static java.util.List<String> unreadablePacks = java.util.List.of();
 
     private TlmModelLibrary() {}
 
@@ -343,18 +347,26 @@ public final class TlmModelLibrary {
         // and only partly refilled, so maids silently lost their meshes until the
         // next reload.
         Map<String, TlmMeshEntry> built = new LinkedHashMap<>();
+        Map<String, String> failures = new LinkedHashMap<>();
+        Set<String> unreadable = new java.util.LinkedHashSet<>();
         int[] converted = {0};
         int[] seen = {0};
 
-        // 1) tlm_custom_pack folder packs — direct disk IO (mirrors TLM's CustomPackLoader)
+        // 1) tlm_custom_pack folder and ZIP packs — direct IO (mirrors TLM's CustomPackLoader)
         Path packFolder = net.minecraft.client.Minecraft.getInstance().gameDirectory.toPath().resolve("tlm_custom_pack");
         if (Files.isDirectory(packFolder)) {
-            try (var stream = Files.walk(packFolder, 1)) {
-                stream.filter(Files::isDirectory).skip(1)
-                        .filter(pack -> PackFileIO.isInsideReal(pack, packFolder))
-                        .forEach(pack -> scanDiskPack(pack, built, converted, seen));
+            try (var stream = Files.list(packFolder)) {
+                stream.filter(pack -> PackFileIO.isInsideReal(pack, packFolder))
+                        .forEach(pack -> {
+                            if (Files.isDirectory(pack)) {
+                                scanDiskPack(pack, built, failures, unreadable, converted, seen);
+                            } else if (Files.isRegularFile(pack) && TlmPackZip.isZipPack(pack)) {
+                                scanZipPack(pack, built, failures, unreadable, converted, seen);
+                            }
+                        });
             } catch (Exception e) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to scan tlm_custom_pack: {}", e.toString());
+                unreadable.add("tlm_custom_pack");
             }
         }
 
@@ -375,18 +387,31 @@ public final class TlmModelLibrary {
                             }
                         } catch (Exception e) {
                             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to convert TLM maid model: {}", e.toString());
+                        } finally {
+                            recordConversion(failures, built, element.getAsJsonObject(), manifestId.toString());
                         }
                     }
                 } catch (Exception e) {
                     // Not a hard failure for every namespace (most have no
                     // maid_model.json), but a malformed one must be visible.
                     YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read {}: {}", manifestId, e.toString());
+                    unreadable.add(manifestId.toString());
                 }
             }
         }
 
+        // Server packs are session-scoped and take precedence over the client's
+        // own packs. They are never copied into tlm_custom_pack.
+        for (Path serverPack : TlmServerOverlay.activePacks()) {
+            scanDiskPack(serverPack, built, failures, unreadable, converted, seen);
+        }
+
         MESHES.clear();
         MESHES.putAll(built);
+        failures.keySet().removeAll(built.keySet());
+        CONVERSION_FAILURES.clear();
+        CONVERSION_FAILURES.putAll(failures);
+        unreadablePacks = java.util.List.copyOf(unreadable);
         // Queue every freshly registered model for the tick-driven prewarm, so the
         // first draw of a maid does not pay the mesh parse (see prewarmMeshes).
         PENDING_PREWARM.clear();
@@ -399,7 +424,9 @@ public final class TlmModelLibrary {
         YSMGeoCompat.LOGGER.info("YSM-GEO Compat: generated {} TLM maid meshes from {} model entries", converted[0], seen[0]);
     }
 
-    private static void scanDiskPack(Path packRoot, Map<String, TlmMeshEntry> built, int[] converted, int[] seen) {
+    private static void scanDiskPack(Path packRoot, Map<String, TlmMeshEntry> built,
+                                     Map<String, String> failures, Set<String> unreadable,
+                                     int[] converted, int[] seen) {
         Path assetsDir = packRoot.resolve("assets");
         if (!Files.isDirectory(assetsDir)) return;
         try (var nsStream = Files.list(assetsDir)) {
@@ -420,19 +447,108 @@ public final class TlmModelLibrary {
                             }
                         } catch (Exception e) {
                             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to convert TLM maid model: {}", e.toString());
+                        } finally {
+                            recordConversion(failures, built, element.getAsJsonObject(), packRoot.toString());
                         }
                     }
                 } catch (Exception e) {
                     YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read {}: {}", manifest, e.toString());
+                    unreadable.add(packRoot.toString());
                 }
             });
         } catch (Exception e) {
             YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to scan {}: {}", assetsDir, e.toString());
+            unreadable.add(packRoot.toString());
         }
+    }
+
+    private static void scanZipPack(Path zipPath, Map<String, TlmMeshEntry> built,
+                                    Map<String, String> failures, Set<String> unreadable,
+                                    int[] converted, int[] seen) {
+        try (ZipFile zip = new ZipFile(zipPath.toFile())) {
+            for (String namespace : TlmPackZip.namespaces(zip)) {
+                try {
+                    JsonArray modelList = TlmPackZip.modelList(zip, namespace);
+                    if (modelList == null) continue;
+                    for (JsonElement element : modelList) {
+                        if (!element.isJsonObject()) continue;
+                        seen[0]++;
+                        try {
+                            if (convertEntryFromPack(element.getAsJsonObject(), built,
+                                    location -> TlmPackZip.open(zip, location), zipPath.toString())) {
+                                converted[0]++;
+                            }
+                        } catch (Exception e) {
+                            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to convert TLM maid model from {}: {}",
+                                    zipPath, e.toString());
+                        } finally {
+                            recordConversion(failures, built, element.getAsJsonObject(), zipPath.toString());
+                        }
+                    }
+                } catch (Exception e) {
+                    YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read maid_model.json in {} ({}): {}",
+                            zipPath, namespace, e.toString());
+                    unreadable.add(zipPath.toString());
+                }
+            }
+        } catch (Exception e) {
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to scan TLM ZIP pack {}: {}", zipPath, e.toString());
+            unreadable.add(zipPath.toString());
+        }
+    }
+
+    /** Render-thread snapshot for the maid fallback diagnostic. */
+    public static String conversionFailure(String modelId) {
+        return CONVERSION_FAILURES.get(modelId);
+    }
+
+    /** Pack manifests that could not be scanned in the most recent generation. */
+    public static java.util.List<String> unreadablePacks() {
+        return unreadablePacks;
+    }
+
+    static void recordConversion(Map<String, String> failures, Map<String, TlmMeshEntry> built,
+                                 JsonObject entry, String source) {
+        if (!entry.has("model_id")) return;
+        ResourceLocation id;
+        try { id = safeResourceLocation(entry.get("model_id").getAsString()); }
+        catch (RuntimeException ignored) { return; }
+        if (id == null) return;
+        String base = id.toString();
+        if (built.containsKey(base)) failures.remove(base);
+        else failures.put(base, "declared in " + source + " but geometry or mesh conversion failed");
+        if (!entry.has("extra_textures") || !entry.get("extra_textures").isJsonArray()) return;
+        for (JsonElement texture : entry.getAsJsonArray("extra_textures")) {
+            try {
+                ResourceLocation extra = safeResourceLocation(texture.getAsString());
+                if (extra == null) continue;
+                String variant = base + "_" + variantHash(extra);
+                if (built.containsKey(variant)) failures.remove(variant);
+                else failures.put(variant, "extra texture " + extra + " declared in " + source
+                        + " is missing or could not be converted");
+            } catch (RuntimeException ignored) {
+                // Malformed variant metadata is already reported by the conversion path.
+            }
+        }
+    }
+
+    @FunctionalInterface
+    private interface PackReader {
+        /** Return null for a missing resource; the caller closes a non-null stream. */
+        InputStream open(ResourceLocation location) throws IOException;
     }
 
     /** Convert a model entry, reading model/texture files directly from disk (packRoot/assets/...). */
     private static boolean convertEntryFromDisk(Path packRoot, JsonObject entry, Map<String, TlmMeshEntry> built) {
+        return convertEntryFromPack(entry, built, location -> {
+            Path file = resolveInPackAssets(packRoot, location);
+            return file == null ? null : Files.newInputStream(file);
+        }, packRoot.toString());
+    }
+
+    /** Folder and ZIP packs share parsing, texture variants, scripts, and mesh registration. */
+    private static boolean convertEntryFromPack(JsonObject entry, Map<String, TlmMeshEntry> built,
+                                                PackReader reader, String packName) {
         if (!entry.has("model_id")) return false;
         String modelId = entry.get("model_id").getAsString();
         ResourceLocation modelIdRl = safeResourceLocation(modelId);
@@ -440,6 +556,7 @@ public final class TlmModelLibrary {
             logRejectedPath("model_id", modelId);
             return false;
         }
+        modelId = modelIdRl.toString();
 
         String namespace = modelIdRl.getNamespace();
         boolean isGecko = entry.has("is_gecko") && entry.get("is_gecko").getAsBoolean();
@@ -453,20 +570,19 @@ public final class TlmModelLibrary {
             logRejectedPath("model", entry.get("model").getAsString());
             return false;
         }
-        Path modelFile = resolveInPackAssets(packRoot, modelRl);
-        if (modelFile == null) return false;
-
         YSMGeoModel geoModel;
-        try {
-            String json = PackFileIO.readString(modelFile);
+        try (InputStream in = reader.open(modelRl)) {
+            if (in == null) return false;
+            String json = PackFileIO.readString(in);
             geoModel = isGecko ? YSMGeoModel.parse(json) : TlmGeoModelParser.parse(json);
         } catch (Exception e) {
-            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to parse TLM model {} ({}): {}", modelId, modelFile, e.toString());
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to parse TLM model {} ({} in {}): {}",
+                    modelId, modelRl, packName, e.toString());
             return false;
         }
         if (geoModel == null) return false;
 
-        Map<String, ScriptAnim> scriptAnims = loadScriptAnimsFromDisk(packRoot, namespace, entry);
+        Map<String, ScriptAnim> scriptAnims = loadScriptAnimsFromPack(reader, entry);
 
         // resolve texture file
         ResourceLocation ourTexture = null;
@@ -476,15 +592,15 @@ public final class TlmModelLibrary {
         if (texRl == null) {
             logRejectedPath("texture", entry.get("texture").getAsString());
         } else {
-            Path texFile = resolveInPackAssets(packRoot, texRl);
-            if (texFile != null) {
-                try {
+            try (InputStream in = reader.open(texRl)) {
+                if (in != null) {
                     ourTexture = YSMMeshLibrary.registerTextureBytes(
                             "tlm/" + texRl.getNamespace() + "/" + texRl.getPath(),
-                            PackFileIO.readBytes(texFile));
-                } catch (Exception e) {
-                    YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM texture {}: {}", texFile, e.toString());
+                            PackFileIO.readBytes(in));
                 }
+            } catch (Exception e) {
+                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM texture {} in {}: {}",
+                        texRl, packName, e.toString());
             }
         }
 
@@ -500,17 +616,15 @@ public final class TlmModelLibrary {
                     logRejectedPath("extra_textures", elem.getAsString());
                     continue;
                 }
-                Path extraFile = resolveInPackAssets(packRoot, extraRl);
-                if (extraFile == null) {
-                    continue;
-                }
-                try {
+                try (InputStream in = reader.open(extraRl)) {
+                    if (in == null) continue;
                     ResourceLocation registered = YSMMeshLibrary.registerTextureBytes(
                             "tlm/" + extraRl.getNamespace() + "/" + extraRl.getPath() + "_" + variantHash(extraRl),
-                            PackFileIO.readBytes(extraFile));
+                            PackFileIO.readBytes(in));
                     extraTextures.put(modelId + "_" + variantHash(extraRl), registered);
                 } catch (Exception e) {
-                    YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM extra texture {}: {}", extraRl, e.toString());
+                    YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to read TLM extra texture {} in {}: {}",
+                            extraRl, packName, e.toString());
                 }
             }
         }
@@ -527,6 +641,7 @@ public final class TlmModelLibrary {
             logRejectedPath("model_id", modelId);
             return false;
         }
+        modelId = modelIdRl.toString();
 
         ResourceLocation modelRl = entry.has("model")
                 ? safeResourceLocation(entry.get("model").getAsString())
@@ -608,17 +723,7 @@ public final class TlmModelLibrary {
      * extra_textures variant (see TLM's CustomModelPack#decorate).
      */
     private static String variantHash(ResourceLocation textureRl) {
-        try {
-            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("MD5");
-            byte[] bytes = digest.digest(textureRl.getPath().getBytes(StandardCharsets.UTF_8));
-            StringBuilder sb = new StringBuilder(32);
-            for (byte b : bytes) {
-                sb.append(String.format("%02x", b));
-            }
-            return sb.toString();
-        } catch (Exception e) {
-            return Integer.toHexString(textureRl.getPath().hashCode());
-        }
+        return TlmPackCatalog.variantHash(textureRl);
     }
 
     private static boolean writeAndRegister(String modelId, ResourceLocation modelIdRl,
@@ -680,7 +785,7 @@ public final class TlmModelLibrary {
      * held-item props) then collapse correctly in battle mode and animate in idle
      * mode instead of rendering all at once.
      */
-    private static Map<String, ScriptAnim> loadScriptAnimsFromDisk(Path packRoot, String namespace, JsonObject entry) {
+    private static Map<String, ScriptAnim> loadScriptAnimsFromPack(PackReader reader, JsonObject entry) {
         Map<String, ScriptAnim> out = new LinkedHashMap<>();
         JsonArray animations = entry.has("animation") && entry.get("animation").isJsonArray()
                 ? entry.getAsJsonArray("animation") : null;
@@ -693,12 +798,9 @@ public final class TlmModelLibrary {
                 logRejectedPath("animation", animElem.getAsString());
                 continue;
             }
-            Path animFile = resolveInPackAssets(packRoot, animRl);
-            if (animFile == null) {
-                continue;
-            }
-            try {
-                mergeScriptAnims(JsonParser.parseString(PackFileIO.readString(animFile)).getAsJsonObject(), out);
+            try (InputStream in = reader.open(animRl)) {
+                if (in == null) continue;
+                mergeScriptAnims(JsonParser.parseString(PackFileIO.readString(in)).getAsJsonObject(), out);
             } catch (Exception e) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to parse TLM animation {}: {}", animRl, e.toString());
             }
