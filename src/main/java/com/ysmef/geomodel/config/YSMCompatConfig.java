@@ -37,6 +37,8 @@ public class YSMCompatConfig {
      * generated mesh JSON on its next draw, so nothing is re-converted.
      */
     public static final ForgeConfigSpec.IntValue LAZY_MODEL_CACHE_SIZE;
+    /** Additional patched layer class names that draw held items. */
+    public static final ForgeConfigSpec.ConfigValue<java.util.List<? extends String>> EXTRA_WEAPON_LAYER_CLASSES;
     public static final ForgeConfigSpec.BooleanValue DOWNLOAD_SERVER_MODELS;
     public static final ForgeConfigSpec.IntValue MAX_DOWNLOADED_MODEL_MIB;
     public static final ForgeConfigSpec.BooleanValue MODEL_TRANSFER_ENABLED;
@@ -69,6 +71,14 @@ public class YSMCompatConfig {
                         "A converted model costs roughly 0.1-1 MB of vertex data, so the default covers every model",
                         "a normal session can meet at once; raise it to keep whole large packs resident.")
                 .defineInRange("lazyModelCacheSize", 64, 8, 512);
+
+        EXTRA_WEAPON_LAYER_CLASSES = builder
+                .comment("Additional Epic Fight layer classes that draw held items for maids.",
+                        "A listed superclass also covers its subclasses. Ordinary Epic Fight item layers and",
+                        "layers registered for a vanilla held-item layer are detected automatically.")
+                .defineListAllowEmpty(java.util.List.of("extraWeaponLayerClasses"),
+                        () -> java.util.List.of("reascer.wom.world.entity.client.HindablePatchedItemInHandLayer"),
+                        entry -> entry instanceof String name && !name.isBlank());
 
         DOWNLOAD_SERVER_MODELS = builder
                 .comment("Download TLM model packs offered by a server running YSM GEO Compat.",

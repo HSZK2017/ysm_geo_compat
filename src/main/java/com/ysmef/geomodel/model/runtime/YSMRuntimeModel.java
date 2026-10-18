@@ -662,6 +662,9 @@ public final class YSMRuntimeModel {
     public static void invalidateAll() {
         synchronized (CACHE) {
             RELOAD_GENERATION.incrementAndGet();
+            // Old models may still be held by an in-flight animation task. Clear
+            // their per-entity state before removing the models from the cache.
+            clearAnimators();
             CACHE.clear();
             PRELOADING.clear();
             FAILED_UNTIL.clear();

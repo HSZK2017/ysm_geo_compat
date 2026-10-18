@@ -94,7 +94,6 @@ public class YSMCompatClientEvents {
     /** Render-thread rebuild used by F3+T and by a server pack becoming active or disconnecting. */
     public static void regenerateMeshes(net.minecraft.server.packs.resources.ResourceManager resourceManager) {
             YSMRuntimeModel.invalidateAll();
-            YSMRuntimeModel.clearAnimators();
             // Drop every re-bound bind armature and captured pose of the model-part
             // pose correction (YsmBindArmature): the meshes are regenerated below
             // and the old instances are dropped, so the cached per-model armatures

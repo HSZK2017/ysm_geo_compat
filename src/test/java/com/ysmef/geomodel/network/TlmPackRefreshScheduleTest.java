@@ -21,6 +21,11 @@ class TlmPackRefreshScheduleTest {
         assertEquals("maid:second", schedule.nextDue(start + TlmPackRefreshSchedule.INTERVAL_NANOS,
                 id -> id.equals("maid:second")));
         assertEquals("maid:first", schedule.nextDue(start + TlmPackRefreshSchedule.INTERVAL_NANOS, id -> true));
+        schedule.defer("maid:first", start, TlmTransferTimeouts.retryDelay(3));
+        assertNull(schedule.nextDue(start + TlmTransferTimeouts.retryDelay(3) - 1,
+                id -> id.equals("maid:first")));
+        assertEquals("maid:first", schedule.nextDue(start + TlmTransferTimeouts.retryDelay(3),
+                id -> id.equals("maid:first")));
         schedule.clear();
         assertNull(schedule.nextDue(Long.MAX_VALUE, id -> true));
     }

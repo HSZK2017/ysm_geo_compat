@@ -4,7 +4,6 @@ import net.minecraft.resources.ResourceLocation;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -17,24 +16,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class MeshTextureLifecycleTest {
     @SuppressWarnings("unchecked")
-    private static <T> Map<String, T> state(String fieldName) throws Exception {
-        Field field = YSMMeshLibrary.class.getDeclaredField(fieldName);
-        field.setAccessible(true);
-        return (Map<String, T>) field.get(null);
-    }
-
-    @SuppressWarnings("unchecked")
     private static Map<String, TlmModelLibrary.TlmMeshEntry> entries() throws Exception {
         Field field = TlmModelLibrary.class.getDeclaredField("MESHES");
         field.setAccessible(true);
         return (Map<String, TlmModelLibrary.TlmMeshEntry>) field.get(null);
-    }
-
-    @SuppressWarnings("unchecked")
-    private static Set<String> loadedMeshes() throws Exception {
-        Field field = YSMMeshLibrary.class.getDeclaredField("LOADED_MODELS");
-        field.setAccessible(true);
-        return (Set<String>) field.get(null);
     }
 
     @Test
@@ -51,25 +36,25 @@ class MeshTextureLifecycleTest {
         try {
             assertEquals(owner, TlmModelLibrary.meshOwnerOf(variant));
             YSMMeshLibrary.markMeshLoaded(variant);
-            assertTrue(loadedMeshes().contains(owner));
-            assertFalse(loadedMeshes().contains(variant));
+            assertTrue(YSMMeshResidency.LOADED_MODELS.contains(owner));
+            assertFalse(YSMMeshResidency.LOADED_MODELS.contains(variant));
             assertEquals(Set.of(baseTexture, variantTexture),
                     Set.copyOf(YSMMeshLibrary.releaseTexturesOfModel(owner)));
-            loadedMeshes().remove(owner); // the eviction path removes this marker
+            YSMMeshResidency.LOADED_MODELS.remove(owner); // the eviction path removes this marker
             YSMMeshLibrary.markMeshLoaded(owner);
             assertEquals(Set.of(baseTexture, variantTexture),
                     Set.copyOf(YSMMeshLibrary.releaseTexturesOfModel(owner)));
         } finally {
-            loadedMeshes().remove(owner);
-            state("ACCESS_ORDER").remove(owner);
+            YSMMeshResidency.LOADED_MODELS.remove(owner);
+            YSMMeshResidency.ACCESS_ORDER.remove(owner);
             registry.remove(owner);
             registry.remove(variant);
             YSMMeshLibrary.releaseTexturesOfModel(owner);
             com.ysmef.geomodel.model.runtime.YSMRuntimeModel.invalidate(owner);
             for (ResourceLocation rl : new ResourceLocation[]{baseTexture, variantTexture}) {
                 String key = rl.toString();
-                state("PENDING_TEXTURE_RELEASES").remove(key);
-                state("TEXTURE_TOKENS").remove(key);
+                YSMTextureRegistry.PENDING_TEXTURE_RELEASES.remove(key);
+                YSMTextureRegistry.TEXTURE_TOKENS.remove(key);
             }
         }
     }
@@ -80,8 +65,8 @@ class MeshTextureLifecycleTest {
         ResourceLocation texture = ResourceLocation.fromNamespaceAndPath(
                 "ysm_geo_compat", "textures/test/" + owner + ".png");
         String key = texture.toString();
-        Map<String, Long> tokens = state("TEXTURE_TOKENS");
-        Map<String, Long> pending = state("PENDING_TEXTURE_DECODES");
+        Map<String, Long> tokens = YSMTextureRegistry.TEXTURE_TOKENS;
+        Map<String, Long> pending = YSMTextureRegistry.PENDING_TEXTURE_DECODES;
         try {
             YSMMeshLibrary.bindModelTexture(owner, texture);
             Long oldToken = tokens.get(key);
@@ -92,18 +77,16 @@ class MeshTextureLifecycleTest {
             Long newToken = tokens.get(key);
             assertNotNull(newToken);
             assertNotEquals(oldToken, newToken);
-            Method isCurrent = YSMMeshLibrary.class.getDeclaredMethod("isCurrentTexture", String.class, long.class);
-            isCurrent.setAccessible(true);
-            assertFalse((Boolean) isCurrent.invoke(null, key, oldToken.longValue()));
-            assertTrue((Boolean) isCurrent.invoke(null, key, newToken.longValue()));
-            assertFalse(state("PENDING_TEXTURE_RELEASES").containsKey(key));
+            assertFalse(YSMTextureRegistry.isCurrentTexture(key, oldToken.longValue()));
+            assertTrue(YSMTextureRegistry.isCurrentTexture(key, newToken.longValue()));
+            assertFalse(YSMTextureRegistry.PENDING_TEXTURE_RELEASES.containsKey(key));
             pending.put(key, newToken);
             assertFalse(pending.remove(key, oldToken));
             assertEquals(newToken, pending.get(key));
         } finally {
             YSMMeshLibrary.releaseTexturesOfModel(owner);
             pending.remove(key);
-            state("PENDING_TEXTURE_RELEASES").remove(key);
+            YSMTextureRegistry.PENDING_TEXTURE_RELEASES.remove(key);
             tokens.remove(key);
         }
     }
@@ -123,8 +106,8 @@ class MeshTextureLifecycleTest {
         } finally {
             YSMMeshLibrary.releaseTexturesOfModel(firstOwner);
             YSMMeshLibrary.releaseTexturesOfModel(secondOwner);
-            state("PENDING_TEXTURE_RELEASES").remove(key);
-            state("TEXTURE_TOKENS").remove(key);
+            YSMTextureRegistry.PENDING_TEXTURE_RELEASES.remove(key);
+            YSMTextureRegistry.TEXTURE_TOKENS.remove(key);
         }
     }
 }

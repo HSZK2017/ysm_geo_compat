@@ -26,6 +26,7 @@
 - **GEO 模型 → Epic Fight 网格**：将 TLM 模型包（`tlm_custom_pack` 目录包、ZIP 包与 jar 内置 `maid_model.json` 条目，含 GeckoLib 模型）转换为 Epic Fight `animmodels` 网格 JSON。
 - **女仆支持**：通过可选 mixin 钩住 EpicFight_TouhouLittleMaid 的 `PatchedLivingMaidRenderer`，女仆的 TLM 模型替换为转换网格；支持 `extra_textures` 变体（hash 变体 id）与 `show_backpack` 配置。
 - **服务器模型包同步**：联机时按非 YSM 女仆的模型 ID 查询服务器的 TLM 包（包括 EFTLM 已有内置战斗网格的模型），仅在版本哈希不同且本地没有相同包时下载；下载请求在客户端限流排队，已见模型每约 60 秒复查版本，F3+T 后安排立即复查。服务端只打包女仆几何、PNG 贴图和 Gecko JSON 动画，椅子与音效等无关资源不计入传输大小；客户端按服务器 ID 缓存并校验哈希、ZIP 路径及解压大小，断线后撤销本次连接的模型覆盖。远端 JavaScript 动画不会执行。
+- **武器手心定位**：女仆持物层读取转换模型的手部姿势，同时保留原持物层及其他模组的绘制逻辑；后续注册的持物层也会在绘制前识别。
 - **故障诊断**：启动日志提示 JVM 内存、Android 启动器和图形驱动的兼容风险；女仆回退到 EFTLM 默认网格时，日志区分模型包缺失、包无法扫描、转换失败与服务器传输状态。环境诊断可用 `-Dysm_geo_compat.disable_env_check=true` 关闭。
 - **运行时变体控制**：解析模型包的 bedrock molang 动画脚本（平行脚本/状态动画/条件动画），在战斗中只显示默认形态（低血狐狸、魔法阵、枪械、背包等变体正确隐藏），空闲时按真实实体状态（血量/手持物品）动态切换。
 - **外部模组联动动画过滤**：`iss:*`（Iron's Spells）、`tac:*`（TAC 枪械）等与第三方模组联动的动画被自动排除，其变体骨骼按平行脚本保持默认隐藏。
@@ -62,7 +63,12 @@ com.ysmef.geomodel
 │   ├── TlmServerOverlay        # 联机包覆盖及断线清理
 │   ├── YSMJointMapper          # 骨骼名 → EF biped 关节 id（含唯一 normalizeBoneName）
 │   ├── YSMMesh                 # 网格子类：贴图覆盖、逐帧运行时变换、姿势裁剪、路径分派
-│   ├── YSMMeshLibrary          # 生成包路径/sanitize+resolveInside 围栏/贴图注册与上传/预编译池
+│   ├── YSMMeshLibrary          # 稳定入口：协调重载与逐帧资源任务
+│   ├── GeneratedPackStore      # 生成包路径、路径围栏及文件镜像/清理
+│   ├── YSMTextureDecoder       # PNG/JPEG/WebP/AVIF/原始像素解码
+│   ├── YSMTextureRegistry      # 贴图归属、异步解码、上传与延迟释放
+│   ├── YSMMeshResidency        # 网格 LRU 与延迟释放
+│   ├── YSMRuntimePreloader     # 后台运行时预编译任务池
 │   └── runtime/
 │       ├── YSMRuntimeModel     # 运行时模型编译（骨骼表/绑定矩阵/动画编译 + 默认可见性 + 失败退避）
 │       ├── YSMPlayerAnimator   # 逐实体 molang 求值器（状态机/时间线/插值/异步双缓冲/LOD）
@@ -172,7 +178,8 @@ config/ysm_geo_compat/
 - 女仆：选用 TLM 模型包的模型即自动生效；`extra_textures` 变体纹理也会按 TLM 的 hash 变体 id 匹配。使用 YSM 模型的女仆由 YSM_EpicFight_Compat 渲染。
 - 战斗中（EF 接管渲染）显示默认形态；空闲时 molang 驱动的变体（低血狐狸、手持御币魔法阵等）正常切换。
 - 模型文件变更后按 `F3+T` 触发重新转换（贴图与运行时脚本一并失效重载）。
-- 联机服务器若安装本模组并将 TLM 包放在 `tlm_custom_pack`，客户端可自动获取当前女仆使用的包；服务器没有对应包或同步通道时继续使用本地模型及原有渲染回退。下载缓存位于 `config/ysm_geo_compat/server_models/<服务器 ID>`，不会写入 `tlm_custom_pack`。
+- 联机服务器若安装本模组并将 TLM 包放在 `tlm_custom_pack`，客户端可自动获取当前女仆使用的包；服务器没有对应包或同步通道时继续使用本地模型及原有渲染回退。下载缓存位于 `config/ysm_geo_compat/server_models/<服务器 ID>`，不会写入 `tlm_custom_pack`；下次使用该服务器缓存时会清理异常中断遗留的临时下载文件和解压目录。
+- 模型包同步要求客户端和服务器的同步协议一致；等待响应或下载停滞时会释放下载名额并延后重试。
 
 ## 配置
 
@@ -184,6 +191,7 @@ config/ysm_geo_compat/
   该模型下次被绘制时由 Epic Fight 从生成的网格 JSON 重新加载（不重转换、不会永久失效；
   贴图从生成资源包文件重新读取）。
 - `downloadServerModels`：允许下载服务器的 TLM 模型包，默认开；`maxDownloadedModelSizeMiB`：单包压缩大小上限，默认 64 MiB。
+- `extraWeaponLayerClasses`：其他模组的持物图层类名列表；Epic Fight 自带持物层会自动识别，列表仅用于其他类型的图层。
 
 服务器配置 `<世界目录>/serverconfig/ysm_geo_compat-server.toml`：`modelTransferEnabled` 默认开，`maxModelSizeMiB` 默认 64 MiB，`transferKiBPerTick` 默认每玩家每 tick 64 KiB，`maxConcurrentTransfers` 默认 2。
 

@@ -13,6 +13,10 @@ final class TlmPackRefreshSchedule {
         nextQuery.put(modelId, now + INTERVAL_NANOS);
     }
 
+    void defer(String modelId, long now, long delayNanos) {
+        nextQuery.put(modelId, now + delayNanos);
+    }
+
     void refreshNow() {
         nextQuery.replaceAll((id, deadline) -> Long.MIN_VALUE);
     }

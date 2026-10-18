@@ -19,6 +19,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -28,12 +29,17 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Client-side model query, verified download, session overlay and reload coordination. */
 public final class TlmPackClient {
     public record Resolution(boolean pending, boolean sourceKnown, String unavailableReason) {}
     private enum Phase { QUERIED, CHECKING, READY, DOWNLOADING, WAITING, LOCAL, SERVER, UNAVAILABLE }
-    private record State(Phase phase, String hash, String serverId, long size, String detail) {
+    private record State(Phase phase, String hash, String serverId, long size, String detail,
+                         long sinceNanos, AtomicLong lastChunkNanos) {
+        State(Phase phase, String hash, String serverId, long size, String detail) {
+            this(phase, hash, serverId, size, detail, System.nanoTime(), new AtomicLong());
+        }
         static State of(Phase phase) { return new State(phase, "", "", 0, ""); }
     }
     private static final class Incoming {
@@ -57,9 +63,11 @@ public final class TlmPackClient {
     private static final AtomicInteger SESSION = new AtomicInteger();
     private static final Map<String, State> MODELS = new ConcurrentHashMap<>();
     private static final Map<String, String> ACTIVE_HASHES = new HashMap<>(); // client thread only
+    private static final Map<String, Integer> TIMEOUT_COUNTS = new HashMap<>(); // client thread only
     private static final TlmPackRefreshSchedule REFRESH = new TlmPackRefreshSchedule();
     private static final Map<String, Incoming> INCOMING = new HashMap<>(); // IO thread only
     private static final Map<String, Path> MATERIALIZED = new HashMap<>(); // IO thread only
+    private static final Set<Path> CLEANED_ROOTS = new HashSet<>(); // IO thread only
     private static final ConcurrentLinkedQueue<Runnable> MAIN = new ConcurrentLinkedQueue<>();
     private static boolean tlmDirty;
     private static boolean meshDirty;
@@ -112,6 +120,7 @@ public final class TlmPackClient {
         DOWNLOADS.remove(info.modelId());
         if (current.phase() == Phase.DOWNLOADING) wakeWaiters(current);
         if (info.status() != TlmPackNetwork.Status.AVAILABLE) {
+            TIMEOUT_COUNTS.remove(info.modelId());
             IO.execute(() -> abort(info.modelId()));
             boolean hadServerCopy = ACTIVE_HASHES.containsKey(info.modelId());
             if (info.status() == TlmPackNetwork.Status.NOT_FOUND
@@ -148,6 +157,14 @@ public final class TlmPackClient {
     /** Chunk processing is serialized on one IO thread and never blocks a network or render thread. */
     public static void onChunk(TlmPackNetwork.Chunk chunk, Connection source) {
         if (!currentConnection(source)) return;
+        if (chunk.data().length == 0) {
+            State state = MODELS.get(chunk.modelId());
+            if (state != null && state.phase() == Phase.DOWNLOADING
+                    && chunk.offset() == 0 && chunk.total() == state.size()) {
+                state.lastChunkNanos().set(System.nanoTime());
+            }
+            return;
+        }
         int session = SESSION.get();
         IO.execute(() -> append(session, chunk));
     }
@@ -161,6 +178,7 @@ public final class TlmPackClient {
         SESSION.incrementAndGet();
         MODELS.clear();
         ACTIVE_HASHES.clear();
+        TIMEOUT_COUNTS.clear();
         DOWNLOADS.clear();
         REFRESH.clear();
         REFRESH_REQUESTED.set(false);
@@ -168,6 +186,7 @@ public final class TlmPackClient {
         IO.execute(() -> {
             for (String modelId : java.util.List.copyOf(INCOMING.keySet())) abort(modelId);
             MATERIALIZED.clear();
+            CLEANED_ROOTS.clear();
         });
         if (TlmServerOverlay.clear()) {
             tlmDirty = true;
@@ -182,6 +201,7 @@ public final class TlmPackClient {
             try { action.run(); }
             catch (Throwable error) { YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: pack update failed", error); }
         }
+        expireStalled(System.nanoTime());
         if (REFRESH_REQUESTED.getAndSet(false)) {
             REFRESH.refreshNow();
         }
@@ -196,6 +216,10 @@ public final class TlmPackClient {
                             || state.phase() == Phase.SERVER || state.phase() == Phase.UNAVAILABLE);
                 });
                 if (due == null) break;
+                State dueState = MODELS.get(due);
+                if (dueState != null && dueState.phase() == Phase.UNAVAILABLE) {
+                    MODELS.replace(due, dueState, State.of(Phase.QUERIED));
+                }
                 TlmPackNetwork.sendToServer(new TlmPackNetwork.Query(due));
             }
         }
@@ -238,6 +262,7 @@ public final class TlmPackClient {
                 post(session, () -> {
                     if (MODELS.get(modelId) != offer) return;
                     MODELS.put(modelId, State.of(Phase.LOCAL));
+                    TIMEOUT_COUNTS.remove(modelId);
                     REFRESH.track(modelId, System.nanoTime());
                     forgetServerCopy(modelId);
                 });
@@ -274,6 +299,10 @@ public final class TlmPackClient {
         if (state == null || state.phase() != Phase.DOWNLOADING) return;
         Incoming incoming = INCOMING.get(modelId);
         try {
+            if (incoming != null && incoming.offer != state) {
+                abort(modelId);
+                incoming = null;
+            }
             if (incoming == null) {
                 if (chunk.offset() != 0) throw new IOException("first chunk has a nonzero offset");
                 Path root = cacheRoot(state.serverId());
@@ -287,6 +316,7 @@ public final class TlmPackClient {
             }
             incoming.out.write(chunk.data());
             incoming.received += chunk.data().length;
+            state.lastChunkNanos().set(System.nanoTime());
             if (incoming.received == incoming.offer.size()) complete(session, incoming);
         } catch (Exception e) {
             abort(modelId);
@@ -322,6 +352,7 @@ public final class TlmPackClient {
 
     private static void activate(String modelId, State offer, Path cached) {
         DOWNLOADS.remove(modelId);
+        TIMEOUT_COUNTS.remove(modelId);
         MODELS.put(modelId, new State(Phase.SERVER, offer.hash(), offer.serverId(), offer.size(), ""));
         ACTIVE_HASHES.put(modelId, offer.hash());
         MODELS.replaceAll((id, state) -> state.phase() == Phase.WAITING
@@ -366,6 +397,41 @@ public final class TlmPackClient {
                 modelId, reason);
     }
 
+    private static void expireStalled(long now) {
+        for (var entry : MODELS.entrySet()) {
+            String modelId = entry.getKey();
+            State state = entry.getValue();
+            long limit = switch (state.phase()) {
+                case QUERIED -> TlmTransferTimeouts.QUERY_NANOS;
+                case CHECKING -> TlmTransferTimeouts.CHECK_NANOS;
+                case DOWNLOADING -> TlmTransferTimeouts.FIRST_CHUNK_NANOS;
+                default -> 0;
+            };
+            if (limit == 0) continue;
+            boolean expired = state.phase() == Phase.DOWNLOADING
+                    ? TlmTransferTimeouts.downloadExpired(now, state.sinceNanos(), state.lastChunkNanos().get())
+                    : TlmTransferTimeouts.expired(now, state.sinceNanos(), 0, limit);
+            if (!expired) continue;
+            String reason = switch (state.phase()) {
+                case QUERIED -> "server did not answer the model query";
+                case CHECKING -> "local pack check did not finish";
+                case DOWNLOADING -> "server pack download stopped making progress";
+                default -> throw new IllegalStateException("non-pending phase");
+            };
+            State failed = new State(Phase.UNAVAILABLE, "", "", 0, reason);
+            if (!MODELS.replace(modelId, state, failed)) continue;
+            DOWNLOADS.remove(modelId);
+            if (state.phase() == Phase.DOWNLOADING) {
+                wakeWaiters(state);
+                IO.execute(() -> abort(modelId, state));
+            }
+            int count = TIMEOUT_COUNTS.merge(modelId, 1, Integer::sum);
+            REFRESH.defer(modelId, now, TlmTransferTimeouts.retryDelay(count));
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: server TLM model '{}' timed out ({}); retrying later",
+                    modelId, reason);
+        }
+    }
+
     private static void forgetServerCopy(String modelId) {
         if (ACTIVE_HASHES.remove(modelId) != null
                 && TlmServerOverlay.retainHashes(Set.copyOf(ACTIVE_HASHES.values()))) {
@@ -399,6 +465,13 @@ public final class TlmPackClient {
         if (!root.toRealPath().startsWith(base.toRealPath()) || Files.isSymbolicLink(root)) {
             throw new IOException("linked server cache directory");
         }
+        try {
+            TlmPackCacheCleanup.cleanOnce(root, CLEANED_ROOTS);
+        } catch (IOException e) {
+            // Stale temporary files do not make a verified cached pack unusable.
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: could not clean old server pack transfers in '{}': {}",
+                    root, e.toString());
+        }
         return root;
     }
 
@@ -413,6 +486,11 @@ public final class TlmPackClient {
         if (incoming == null) return;
         try { incoming.out.close(); } catch (IOException ignored) {}
         try { Files.deleteIfExists(incoming.spool); } catch (IOException ignored) {}
+    }
+
+    private static void abort(String modelId, State expected) {
+        Incoming incoming = INCOMING.get(modelId);
+        if (incoming != null && incoming.offer == expected) abort(modelId);
     }
 
     private static void post(int session, Runnable action) {

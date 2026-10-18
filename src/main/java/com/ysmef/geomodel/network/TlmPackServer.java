@@ -36,6 +36,7 @@ public final class TlmPackServer {
     private static final long MIN_REQUERY_NANOS = TimeUnit.SECONDS.toNanos(5);
     // Shorter than the client's poll interval, so every periodic query verifies content.
     private static final long HASH_REFRESH_NANOS = TimeUnit.SECONDS.toNanos(30);
+    private static final long HEARTBEAT_NANOS = TimeUnit.SECONDS.toNanos(20);
     private static final Path PACK_FOLDER = Path.of("tlm_custom_pack");
     private static final Path SERVER_ID_FILE = Path.of("config", "ysm_geo_compat", "server_id.txt");
     private static final ExecutorService IO = Executors.newSingleThreadExecutor(task -> {
@@ -54,7 +55,12 @@ public final class TlmPackServer {
         volatile boolean failed;
         volatile boolean changed;
         int offset;
-        Download(String modelId, Offer offer) { this.modelId = modelId; this.offer = offer; }
+        long lastHeartbeatNanos;
+        Download(String modelId, Offer offer) {
+            this.modelId = modelId;
+            this.offer = offer;
+            this.lastHeartbeatNanos = System.nanoTime();
+        }
     }
     private static final class PlayerState {
         final Map<String, Long> queried = new HashMap<>();
@@ -83,6 +89,9 @@ public final class TlmPackServer {
             return;
         }
         state.pendingQueries.remove(modelId);
+        // A fresh query after a client timeout replaces any abandoned transfer.
+        // The old one-shot request marker must not reject the retry forever.
+        resetTransferForQuery(state, modelId);
         state.queried.put(modelId, now);
         answerQuery(player, modelId);
     }
@@ -142,10 +151,12 @@ public final class TlmPackServer {
                 if (now < query.getValue()) continue;
                 String modelId = query.getKey();
                 queries.remove();
+                resetTransferForQuery(state, modelId);
                 state.queried.put(modelId, now);
                 answerQuery(player, modelId);
                 refreshed++;
             }
+            for (Download queued : state.queue) heartbeat(player, queued, now);
             Download transfer = state.active;
             if (transfer == null) {
                 if (state.queue.isEmpty() || activeCount >= maxConcurrent()) continue;
@@ -169,7 +180,10 @@ public final class TlmPackServer {
                 continue;
             }
             byte[] bytes = transfer.bytes;
-            if (bytes == null) continue;
+            if (bytes == null) {
+                heartbeat(player, transfer, now);
+                continue;
+            }
             int sent = 0;
             while (sent < budget && transfer.offset < bytes.length) {
                 int length = Math.min(Math.min(TlmPackNetwork.CHUNK_BYTES, budget - sent), bytes.length - transfer.offset);
@@ -260,6 +274,19 @@ public final class TlmPackServer {
         state.active.bytes = null;
         state.active = null;
         activeCount = Math.max(0, activeCount - 1);
+    }
+
+    private static void resetTransferForQuery(PlayerState state, String modelId) {
+        if (state.active != null && state.active.modelId.equals(modelId)) finish(state);
+        state.queue.removeIf(download -> download.modelId.equals(modelId));
+        String prefix = modelId + "\u0000";
+        state.requested.removeIf(key -> key.startsWith(prefix));
+    }
+
+    private static void heartbeat(ServerPlayer player, Download transfer, long now) {
+        if (now - transfer.lastHeartbeatNanos < HEARTBEAT_NANOS) return;
+        transfer.lastHeartbeatNanos = now;
+        reply(player, new TlmPackNetwork.Chunk(transfer.modelId, 0, transfer.offer.size(), new byte[0]));
     }
 
     private static void release(PlayerState state) {

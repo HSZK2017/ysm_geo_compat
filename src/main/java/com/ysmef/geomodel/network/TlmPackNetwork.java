@@ -19,7 +19,8 @@ import java.util.function.Supplier;
 
 /** Optional protocol: neither side sends packets to peers without the same channel version. */
 public final class TlmPackNetwork {
-    public static final String VERSION = "1.0.0";
+    // Zero-length chunks are transfer heartbeats; older peers must not treat them as failed data.
+    public static final String VERSION = "1.1.0";
     public static final int CHUNK_BYTES = 32 * 1024;
     private static final ResourceLocation ID = ResourceLocation.fromNamespaceAndPath(YSMGeoCompat.MODID, "tlm_pack_transfer");
     private static final SimpleChannel CHANNEL = NetworkRegistry.newSimpleChannel(ID, () -> VERSION,

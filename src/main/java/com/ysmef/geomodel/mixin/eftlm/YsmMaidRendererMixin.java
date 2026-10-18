@@ -6,7 +6,6 @@ import com.ysmef.geomodel.eftlm.YsmMaidMeshSupport;
 import com.ysmef.geomodel.eftlm.TlmMissingMeshDiagnosis;
 import com.ysmef.geomodel.model.TlmModelLibrary;
 import com.ysmef.geomodel.network.TlmPackClient;
-import com.ysmef.geomodel.renderer.layer.YsmAnchoredItemLayer;
 import net.EFTLM.EF.Capability.MaidPatch;
 import net.EFTLM.EF.Model.EFTLM_Meshes;
 import net.EFTLM.EF.Model.Mesh.MaidMesh;
@@ -14,12 +13,10 @@ import net.EFTLM.EF.Render.PatchedLivingMaidRenderer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.ModifyArg;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import yesman.epicfight.api.asset.AssetAccessor;
 import yesman.epicfight.api.client.model.Meshes;
 import yesman.epicfight.client.mesh.HumanoidMesh;
-import yesman.epicfight.client.renderer.patched.layer.PatchedLayer;
 
 /**
  * Bytecode-level hijack of EpicFight_TouhouLittleMaid's maid mesh selection.
@@ -45,14 +42,6 @@ import yesman.epicfight.client.renderer.patched.layer.PatchedLayer;
  */
 @Mixin(value = PatchedLivingMaidRenderer.class, remap = false)
 public abstract class YsmMaidRendererMixin {
-
-    /** Replace EFTLM's ordinary item layer while preserving its rendering behavior. */
-    @ModifyArg(method = "<init>(Lnet/minecraft/client/renderer/entity/EntityRendererProvider$Context;Lnet/minecraft/world/entity/EntityType;)V",
-            at = @At(value = "INVOKE", target = "Lnet/EFTLM/EF/Render/PatchedLivingMaidRenderer;addCustomLayer(Lyesman/epicfight/client/renderer/patched/layer/PatchedLayer;)V"),
-            index = 0, remap = false, require = 0)
-    private PatchedLayer<?, ?, ?, ?> ysmgeo$anchorHeldItems(PatchedLayer<?, ?, ?, ?> original) {
-        return new YsmAnchoredItemLayer<>();
-    }
 
     /**
      * Per-model mesh-source confirmation logs, deduped by (source, model id):
