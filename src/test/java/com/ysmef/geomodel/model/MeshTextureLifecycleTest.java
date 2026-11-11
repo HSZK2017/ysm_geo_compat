@@ -92,6 +92,36 @@ class MeshTextureLifecycleTest {
     }
 
     @Test
+    void decodedTextureKeepsItsTicketUntilFrameDrainAndCannotClearAReplacement() {
+        String owner = "base_" + UUID.randomUUID();
+        ResourceLocation texture = ResourceLocation.fromNamespaceAndPath(
+                "ysm_geo_compat", "textures/test/" + owner + ".png");
+        String key = texture.toString();
+        Map<String, Long> tokens = YSMTextureRegistry.TEXTURE_TOKENS;
+        Map<String, Long> pending = YSMTextureRegistry.PENDING_TEXTURE_DECODES;
+        try {
+            YSMMeshLibrary.bindModelTexture(owner, texture);
+            Long oldToken = tokens.get(key);
+            pending.put(key, oldToken);
+            YSMTextureRegistry.decodeTextureForUpload(texture, oldToken, new byte[]{0, 0, 0, -1});
+            assertEquals(oldToken, pending.get(key));
+            assertFalse(YSMMeshLibrary.isTextureUploaded(texture));
+
+            YSMMeshLibrary.releaseTexturesOfModel(owner);
+            YSMMeshLibrary.bindModelTexture(owner, texture);
+            Long replacement = tokens.get(key);
+            pending.put(key, replacement);
+            YSMMeshLibrary.processPendingTextureUploads();
+            assertEquals(replacement, pending.get(key));
+            assertFalse(YSMMeshLibrary.isTextureUploaded(texture));
+        } finally {
+            YSMMeshLibrary.releaseTexturesOfModel(owner);
+            YSMMeshLibrary.processPendingTextureUploads();
+            YSMTextureRegistry.PENDING_TEXTURE_RELEASES.remove(key);
+        }
+    }
+
+    @Test
     void sharedTextureSurvivesUntilTheLastMeshOwnerIsEvicted() throws Exception {
         String firstOwner = "first_" + UUID.randomUUID();
         String secondOwner = "second_" + UUID.randomUUID();

@@ -14,6 +14,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicLong;
 
 /** Owns texture registrations, decode tickets, GL uploads, and delayed releases. */
@@ -23,8 +24,7 @@ final class YSMTextureRegistry {
 
     /**
      * textureRL string -> original encoded texture bytes, until the texture is
-     * uploaded (registered from the conversion path, drained on the render
-     * thread). Concurrent because the conversion runs off-thread.
+     * uploaded (registered during conversion, read by the decode workers).
      */
     private static final Map<String, byte[]> TEXTURE_DATA = new ConcurrentHashMap<>();
 
@@ -56,7 +56,7 @@ final class YSMTextureRegistry {
     private static final AtomicLong NEXT_TEXTURE_TOKEN = new AtomicLong();
     static final Map<String, Long> TEXTURE_TOKENS = new ConcurrentHashMap<>();
 
-    /** textureRL -> token of the decode currently owned by the background pool. */
+    /** textureRL -> token held through decoding and render-thread upload. */
     static final Map<String, Long> PENDING_TEXTURE_DECODES = new ConcurrentHashMap<>();
 
     /** textureRL string -> ticks left before its GL texture is released. */
@@ -97,6 +97,7 @@ final class YSMTextureRegistry {
      */
     static void invalidateAll() {
         Set<String> textureKeys;
+        List<TextureUploadTask> discarded = new java.util.ArrayList<>();
         synchronized (TEXTURE_TOKENS) {
             textureKeys = new java.util.HashSet<>(UPLOADED_TEXTURES.keySet());
             textureKeys.addAll(PENDING_TEXTURE_RELEASES.keySet());
@@ -108,11 +109,12 @@ final class YSMTextureRegistry {
             MODEL_TEXTURES.clear();
             PENDING_TEXTURE_DECODES.clear();
             PENDING_TEXTURE_RELEASES.clear();
+            // Revoke tokens and take ownership of all queued native images together.
+            for (TextureUploadTask task = COMPLETED_UPLOADS.poll(); task != null; task = COMPLETED_UPLOADS.poll()) {
+                discarded.add(task);
+            }
         }
-        // Decoded but not yet uploaded images own native (off-heap) buffers.
-        for (TextureUploadTask task = COMPLETED_UPLOADS.poll(); task != null; task = COMPLETED_UPLOADS.poll()) {
-            closeQuietly(task.image());
-        }
+        for (TextureUploadTask task : discarded) closeQuietly(task.image());
         for (String key : textureKeys) {
             try {
                 Minecraft.getInstance().getTextureManager().release(ResourceLocation.parse(key));
@@ -175,64 +177,59 @@ final class YSMTextureRegistry {
             return;
         }
         String key = rl.toString();
-        if (UPLOADED_TEXTURES.containsKey(key)) {
+        if (UPLOADED_TEXTURES.containsKey(key) || PENDING_TEXTURE_DECODES.containsKey(key)) {
             return;
         }
-        Long token = TEXTURE_TOKENS.get(key);
-        if (token == null) {
-            return;
+        Long token;
+        byte[] data;
+        synchronized (TEXTURE_TOKENS) {
+            token = TEXTURE_TOKENS.get(key);
+            if (token == null || UPLOADED_TEXTURES.containsKey(key)
+                    || PENDING_TEXTURE_DECODES.putIfAbsent(key, token) != null) {
+                return;
+            }
+            data = TEXTURE_DATA.get(key);
+            PENDING_TEXTURE_RELEASES.remove(key);
         }
-        byte[] data = TEXTURE_DATA.get(key);
-        if (PENDING_TEXTURE_DECODES.putIfAbsent(key, token) != null) {
-            return;
+        try {
+            DECODE_POOL.execute(() -> decodeTextureForUpload(rl, token, data));
+        } catch (RejectedExecutionException e) {
+            PENDING_TEXTURE_DECODES.remove(key, token);
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to schedule texture decode {}", key, e);
         }
-        // a re-upload cancels any delayed release of the same location
-        PENDING_TEXTURE_RELEASES.remove(key);
-        DECODE_POOL.execute(() -> {
-            NativeImage image = null;
-            try {
-                byte[] bytes = data;
-                if (bytes == null) {
-                    // The bytes are gone if the texture was released by an eviction
-                    // (or uploaded in an earlier generation). The generated pack
-                    // file written at registration time is the durable copy, so
-                    // the texture is re-read and re-uploaded instead of leaving
-                    // the model on the fallback path for the rest of the session.
-                    bytes = GeneratedPackStore.readPackTextureBytes(rl);
-                }
-                if (bytes == null) {
-                    return;
-                }
-                image = YSMTextureDecoder.decodeTexture(key, bytes);
-                if (image == null) {
-                    markTextureDecodeFailed(key, token, data);
-                    return;
-                }
-                // The translucency scan runs here, on the decode worker: the
-                // per-frame upload drain has a small time budget and must not
-                // spend it scanning millions of pixels.
-                boolean translucent = hasTranslucentPixels(image);
+    }
+
+    static void decodeTextureForUpload(ResourceLocation rl, long token, byte[] data) {
+        String key = rl.toString();
+        NativeImage image = null;
+        boolean queued = false;
+        try {
+            if (!isCurrentTexture(key, token)) return;
+            // Eviction drops the encoded bytes, so restored models read the generated pack.
+            byte[] bytes = data != null ? data : GeneratedPackStore.readPackTextureBytes(rl);
+            if (bytes == null) return;
+            image = YSMTextureDecoder.decodeTexture(key, bytes);
+            if (image == null) {
+                markTextureDecodeFailed(key, token, data);
+                return;
+            }
+            // Scan on the decode worker to keep pixel work out of the frame budget.
+            boolean translucent = hasTranslucentPixels(image);
+            synchronized (TEXTURE_TOKENS) {
                 if (isCurrentTexture(key, token)) {
                     COMPLETED_UPLOADS.add(new TextureUploadTask(rl, image, translucent, token));
-                    image = null; // the queue owns the native buffer now
-                    try {
-                        Minecraft.getInstance().execute(YSMTextureRegistry::processPendingTextureUploads);
-                    } catch (Throwable t) {
-                        // The client tick also drains this queue, so the image is
-                        // still owned and will be uploaded or closed there.
-                        YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to schedule texture upload {}", key, t);
-                    }
+                    queued = true;
                 }
-            } catch (Throwable t) {
-                YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to decode texture {}", key, t);
-                markTextureDecodeFailed(key, token, data);
-            } finally {
-                if (image != null) {
-                    closeQuietly(image);
-                }
+            }
+        } catch (Throwable t) {
+            YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to decode texture {}", key, t);
+            markTextureDecodeFailed(key, token, data);
+        } finally {
+            if (!queued) {
+                if (image != null) closeQuietly(image);
                 PENDING_TEXTURE_DECODES.remove(key, token);
             }
-        });
+        }
     }
 
     static boolean isCurrentTexture(String key, long token) {
@@ -251,25 +248,20 @@ final class YSMTextureRegistry {
     }
 
     /**
-     * Drain finished decodes into the texture manager, within a per-frame time
-     * budget. Must run on the render thread. Leftovers stay queued and the drain
-     * re-posts itself for the next frame.
+     * Drain finished decodes at render tick START. Any leftover tasks wait for the next frame.
      */
     static void processPendingTextureUploads() {
-        if (COMPLETED_UPLOADS.isEmpty()) {
-            return;
-        }
-        long deadline = System.nanoTime() + TEXTURE_UPLOAD_BUDGET_NANOS;
-        while (true) {
-            TextureUploadTask task = COMPLETED_UPLOADS.poll();
-            if (task == null) {
-                return;
-            }
-            String key = task.location().toString();
+        FrameTaskDrain.drain(COMPLETED_UPLOADS, YSMTextureRegistry::uploadTexture,
+                System::nanoTime, TEXTURE_UPLOAD_BUDGET_NANOS);
+    }
+
+    private static void uploadTexture(TextureUploadTask task) {
+        String key = task.location().toString();
+        try {
             if (!isCurrentTexture(key, task.token())) {
                 // This resource was evicted or replaced after decoding.
                 closeQuietly(task.image());
-                continue;
+                return;
             }
             DynamicTexture texture;
             try {
@@ -277,23 +269,21 @@ final class YSMTextureRegistry {
             } catch (Throwable t) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to create texture {}", key, t);
                 closeQuietly(task.image());
-                continue;
+                return;
             }
             try {
                 Minecraft.getInstance().getTextureManager().register(task.location(), texture);
             } catch (Throwable t) {
                 YSMGeoCompat.LOGGER.warn("YSM-GEO Compat: failed to upload texture {}", key, t);
                 texture.close();
-                continue;
+                return;
             }
             PENDING_TEXTURE_RELEASES.remove(key);
             TEXTURE_TRANSLUCENT.put(key, task.translucent());
             UPLOADED_TEXTURES.put(key, Boolean.TRUE);
             TEXTURE_DATA.remove(key);
-            if (System.nanoTime() > deadline) {
-                Minecraft.getInstance().execute(YSMTextureRegistry::processPendingTextureUploads);
-                return;
-            }
+        } finally {
+            PENDING_TEXTURE_DECODES.remove(key, task.token());
         }
     }
 

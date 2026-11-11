@@ -70,9 +70,8 @@ public final class YSMMeshLibrary {
         YSMMeshResidency.clearTrackingOnReload();
     }
 
-    /** Render-thread drain of deferred resource work. */
+    /** Client tick maintenance for deferred releases and residency. */
     public static void tick() {
-        YSMTextureRegistry.processPendingTextureUploads();
         YSMTextureRegistry.processPendingTextureReleases();
         YSMMeshResidency.processPendingMeshReleases();
         YSMMeshResidency.trimIfNeeded(TLM_REGISTRY);

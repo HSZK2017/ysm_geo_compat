@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -192,23 +193,27 @@ public final class TlmPackArchive {
         }
     }
 
-    /** Cheap invalidation key for the server's cached offer; content is still rechecked before sending. */
+    /** Metadata invalidation key for short-lived server offers and packed payloads. */
     public static long signature(Path source) throws IOException {
         long value = 0xcbf29ce484222325L;
-        if (Files.isRegularFile(source, LinkOption.NOFOLLOW_LINKS)) {
-            return mix(value, source.getFileName() + ":" + Files.size(source) + ":"
-                    + Files.getLastModifiedTime(source).toMillis());
+        BasicFileAttributes root = Files.readAttributes(source, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (root.isRegularFile()) {
+            return mixAttributes(value, source.getFileName().toString(), root);
         }
-        if (!Files.isDirectory(source, LinkOption.NOFOLLOW_LINKS)) throw new IOException("missing TLM pack");
+        if (!root.isDirectory()) throw new IOException("missing TLM pack");
         List<Path> entries;
         try (var walk = Files.walk(source)) { entries = walk.sorted().toList(); }
         for (Path entry : entries) {
-            if (Files.isSymbolicLink(entry)) throw new IOException("linked TLM pack entry");
-            value = mix(value, relative(source, entry) + ":"
-                    + (Files.isRegularFile(entry) ? Files.size(entry) : 0) + ":"
-                    + Files.getLastModifiedTime(entry).toMillis());
+            BasicFileAttributes attributes = Files.readAttributes(entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (attributes.isSymbolicLink()) throw new IOException("linked TLM pack entry");
+            value = mixAttributes(value, relative(source, entry), attributes);
         }
         return value;
+    }
+
+    private static long mixAttributes(long value, String path, BasicFileAttributes attributes) {
+        return mix(value, path + ":" + (attributes.isRegularFile() ? attributes.size() : 0) + ":"
+                + attributes.lastModifiedTime() + ":" + attributes.fileKey());
     }
 
     private static long mix(long value, String text) {

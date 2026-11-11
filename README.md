@@ -7,7 +7,7 @@
 | 项目 | 值 |
 |---|---|
 | Mod ID | `ysm_geo_compat` |
-| 当前版本 | `1.1.1` |
+| 当前版本 | `1.1.2` |
 | Minecraft | 1.20.1（Forge `[47,)`） |
 | 必装依赖 | Epic Fight `[20.14,)`（与 EpicFight_TouhouLittleMaid 自身区间保持一致，原因见下） |
 | 可选依赖 | Touhou Little Maid `[1.5,)`、EpicFight_TouhouLittleMaid `[1.1,)`、YSM_EpicFight_Compat（YSM 女仆支持） |
@@ -97,8 +97,7 @@ com.ysmef.geomodel
 事件入口两个（总线不同，勿混）：
 
 - `event/YSMCompatClientEvents`（**MOD 总线**）：资源包注册、客户端启动生成、重载监听。
-- `event/YSMGeoClientTickHandler`（**FORGE 总线**，END 相位）：贴图上传排空、延迟释放、LRU 淘汰、
-  分帧预热——所有"不能在绘制中间做"的 GL 工作都收在这里。
+- `event/YSMGeoClientTickHandler`（**FORGE 总线**）：渲染帧开始时按预算上传贴图。客户端 tick 结束时处理模型包同步、延迟释放、LRU 淘汰和分批预热。
 
 ### 数据流
 
@@ -159,7 +158,7 @@ config/ysm_geo_compat/
 要求：JDK 17+（Gradle 运行使用 JDK 21，见 `gradle.properties`）。
 
 ```bash
-./gradlew build     # 产物：build/libs/YSM_GEO_Compat-1.20.1-1.1.1.jar（无内嵌库，无 -all 变体）
+./gradlew build     # 产物：build/libs/YSM_GEO_Compat-1.20.1-1.1.2.jar（无内嵌库，无 -all 变体）
 ./gradlew test      # 单元测试（molang 求值/路径围栏/关节表与骨名归一化）
 ```
 
@@ -169,7 +168,7 @@ config/ysm_geo_compat/
 
 ## 安装
 
-1. 将 `YSM_GEO_Compat-1.20.1-1.1.1.jar` 放入 `mods/`。
+1. 将 `YSM_GEO_Compat-1.20.1-1.1.2.jar` 放入 `mods/`。
 2. 必装 Epic Fight；女仆支持需 Touhou Little Maid + EpicFight_TouhouLittleMaid。
 3. 需要玩家 YSM 模型或 YSM 女仆时，同时安装 YSM_EpicFight_Compat（本模组与其共存时仅处理 TLM 模型）。
 
@@ -179,7 +178,7 @@ config/ysm_geo_compat/
 - 战斗中（EF 接管渲染）显示默认形态；空闲时 molang 驱动的变体（低血狐狸、手持御币魔法阵等）正常切换。
 - 模型文件变更后按 `F3+T` 触发重新转换（贴图与运行时脚本一并失效重载）。
 - 联机服务器若安装本模组并将 TLM 包放在 `tlm_custom_pack`，客户端可自动获取当前女仆使用的包；服务器没有对应包或同步通道时继续使用本地模型及原有渲染回退。下载缓存位于 `config/ysm_geo_compat/server_models/<服务器 ID>`，不会写入 `tlm_custom_pack`；下次使用该服务器缓存时会清理异常中断遗留的临时下载文件和解压目录。
-- 模型包同步要求客户端和服务器的同步协议一致；等待响应或下载停滞时会释放下载名额并延后重试。
+- 模型包同步协议已更新至 `1.1.0`。从模组 `1.1.1` 升级时，请同时更新客户端和服务端以继续使用模型包同步。等待响应或下载停滞时会释放下载名额并延后重试。
 
 ## 配置
 

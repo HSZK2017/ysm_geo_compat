@@ -14,6 +14,7 @@ import net.minecraftforge.network.PacketDistributor;
 import net.minecraftforge.network.NetworkEvent;
 import net.minecraftforge.network.simple.SimpleChannel;
 
+import java.util.Objects;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -30,7 +31,30 @@ public final class TlmPackNetwork {
     public record Query(String modelId) {}
     public record Info(String modelId, Status status, String serverId, long size, String sha256) {}
     public record Download(String modelId, String sha256) {}
-    public record Chunk(String modelId, long offset, long total, byte[] data) {}
+    /** Outbound chunks can share the packed array. Decoded chunks own exactly their slice. */
+    public record Chunk(String modelId, long offset, long total, byte[] data, int dataOffset, int dataLength) {
+        public Chunk {
+            Objects.checkFromIndexSize(dataOffset, dataLength, data.length);
+            if (dataLength > CHUNK_BYTES) throw new IllegalArgumentException("TLM chunk is too large");
+        }
+
+        public Chunk(String modelId, long offset, long total, byte[] data) {
+            this(modelId, offset, total, data, 0, data.length);
+        }
+
+        void encode(FriendlyByteBuf out) {
+            out.writeUtf(modelId);
+            out.writeLong(offset);
+            out.writeLong(total);
+            // Same length prefix and bytes as writeByteArray, without a temporary slice array.
+            out.writeVarInt(dataLength);
+            out.writeBytes(data, dataOffset, dataLength);
+        }
+
+        static Chunk decode(FriendlyByteBuf in) {
+            return new Chunk(in.readUtf(256), in.readLong(), in.readLong(), in.readByteArray(CHUNK_BYTES));
+        }
+    }
 
     private TlmPackNetwork() {}
 
@@ -44,9 +68,7 @@ public final class TlmPackNetwork {
                     b.writeUtf(m.modelId()); b.writeUtf(m.sha256());
                 }, b -> new Download(b.readUtf(256), b.readUtf(64)), TlmPackNetwork::handleDownload,
                 Optional.of(NetworkDirection.PLAY_TO_SERVER));
-        CHANNEL.registerMessage(3, Chunk.class, (m, b) -> {
-                    b.writeUtf(m.modelId()); b.writeLong(m.offset()); b.writeLong(m.total()); b.writeByteArray(m.data());
-                }, b -> new Chunk(b.readUtf(256), b.readLong(), b.readLong(), b.readByteArray(CHUNK_BYTES)),
+        CHANNEL.registerMessage(3, Chunk.class, Chunk::encode, Chunk::decode,
                 TlmPackNetwork::handleChunk, Optional.of(NetworkDirection.PLAY_TO_CLIENT));
     }
 

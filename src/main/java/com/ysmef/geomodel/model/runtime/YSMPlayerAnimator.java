@@ -106,12 +106,8 @@ public final class YSMPlayerAnimator implements Molang.Env {
     private List<Map.Entry<String, MeshPart>> partEntries;
     private int[] partBoneIdx;
 
-    // LOD-style evaluation rate limiting (OpenYSM AnimatableEntity#getRefreshRate):
-    // entities beyond 40 blocks evaluate at 30 Hz, beyond 64 blocks at 10 Hz,
-    // everything else (and the local player) every frame. Skipped frames replay
-    // the last evaluated bone state into the mesh instead of re-evaluating molang.
-    private static final double LOD_DIST_SQR_NEAR = 40.0 * 40.0;
-    private static final double LOD_DIST_SQR_FAR = 64.0 * 64.0;
+    /** Distance-based scheduling state, owned by the render thread. */
+    private final AnimatorCadence cadence = new AnimatorCadence();
     private volatile boolean evaluatedOnce = false;
 
     private final List<YSMRuntimeModel.CompiledAnim> activeAnims = new ArrayList<>();
@@ -177,12 +173,8 @@ public final class YSMPlayerAnimator implements Molang.Env {
      * Evaluate the scripts for this entity this frame and apply per-part hidden
      * flags and transforms to the mesh about to be drawn.
      *
-     * Evaluation is rate-limited by distance (see LOD_DIST_SQR_*): the expensive
-     * part (query refresh, molang evaluation, keyframe lookup, matrix composition)
-     * runs at most every N ticks for distant entities; every frame the stored bone
-     * state from the last full evaluation is replayed into the mesh, so a
-     * rate-limited entity keeps rendering its last known pose instead of
-     * recomputing it.
+     * The evaluation cadence drops to 30 Hz beyond 40 blocks and 10 Hz beyond
+     * 64 blocks. Every frame replays the last completed bone state into the mesh.
      *
      * For entities other than the local player the evaluation itself runs on a
      * background thread (config scriptAsyncEval): the render thread replays the
@@ -190,13 +182,14 @@ public final class YSMPlayerAnimator implements Molang.Env {
      * the mesh push (O(parts), no molang).
      */
     public void apply(YSMMesh mesh, LivingEntity entity, OpenMatrix4f[] poses, float partialTick) {
-        double now = (entity.tickCount + partialTick) / 20.0;
-        if (shouldFullEval(entity)) {
-            if (!evaluatedOnce || !useAsyncEval(entity)) {
-                evaluateSync(entity, partialTick, now);
-            } else {
-                submitAsyncEval(entity, partialTick, now);
-            }
+        int rateHz = evaluationRate(entity);
+        long frameTime = rateHz == 0 ? 0 : System.nanoTime();
+        if (!evaluatedOnce || cadence.isDue(frameTime, rateHz)) {
+            double animationTime = (entity.tickCount + (double) partialTick) / 20.0;
+            boolean evaluated = !evaluatedOnce || !useAsyncEval(entity)
+                    ? evaluateSync(entity, partialTick, animationTime)
+                    : submitAsyncEval(entity, partialTick, animationTime);
+            if (evaluated) cadence.evaluated(frameTime, rateHz);
         }
         pushToMesh(mesh);
     }
@@ -221,29 +214,9 @@ public final class YSMPlayerAnimator implements Molang.Env {
                 mc.options.getCameraType() == CameraType.FIRST_PERSON);
     }
 
-    /**
-     * Distance-based evaluation gate: the local player (and everyone near the
-     * camera) evaluates every frame; entities beyond 40/64 blocks drop to
-     * 30/10 Hz. The first evaluation is always full so the mesh starts with
-     * correct state.
-     */
-    private boolean shouldFullEval(LivingEntity entity) {
-        if (!evaluatedOnce) {
-            return true;
-        }
+    private static int evaluationRate(LivingEntity entity) {
         Player local = Minecraft.getInstance().player;
-        if (local == null || entity == local) {
-            return true;
-        }
-        double distSqr = entity.distanceToSqr(local);
-        int tick = entity.tickCount;
-        if (distSqr > LOD_DIST_SQR_FAR) {
-            return tick % 6 == 0;
-        }
-        if (distSqr > LOD_DIST_SQR_NEAR) {
-            return tick % 2 == 0;
-        }
-        return true;
+        return local == null || entity == local ? 0 : AnimatorCadence.rateForDistance(entity.distanceToSqr(local));
     }
 
     /**
@@ -256,17 +229,19 @@ public final class YSMPlayerAnimator implements Molang.Env {
      * in-flight result is published when it finishes and the next frame
      * re-evaluates, so the skip is invisible.
      */
-    private void evaluateSync(LivingEntity entity, float partialTick, double now) {
+    private boolean evaluateSync(LivingEntity entity, float partialTick, double now) {
         if (!evalPending.compareAndSet(false, true)) {
-            return;
+            return false;
         }
         try {
             evaluate(prepareEvaluation(entity, partialTick, now, captureEvalInputs(entity)));
             evaluatedOnce = true;
+            return true;
         } catch (Throwable t) {
             // never break the render path: the last published result stays
             YSMGeoCompat.LOGGER.warn(
                     "YSM-GEO Compat: synchronous script evaluation failed for model '{}'", model.modelId, t);
+            return false;
         } finally {
             evalPending.set(false);
         }
@@ -291,9 +266,9 @@ public final class YSMPlayerAnimator implements Molang.Env {
      * per animator). Capture every entity/world read on the render thread before
      * scheduling; only script and matrix work runs in the background.
      */
-    private void submitAsyncEval(LivingEntity entity, float partialTick, double now) {
+    private boolean submitAsyncEval(LivingEntity entity, float partialTick, double now) {
         if (!evalPending.compareAndSet(false, true)) {
-            return;
+            return false;
         }
         try {
             PreparedEval prepared = prepareEvaluation(entity, partialTick, now, captureEvalInputs(entity));
@@ -307,9 +282,11 @@ public final class YSMPlayerAnimator implements Molang.Env {
                     evalPending.set(false);
                 }
             });
+            return true;
         } catch (Throwable t) {
             evalPending.set(false);
             reportAsyncFailure(t);
+            return false;
         }
     }
 

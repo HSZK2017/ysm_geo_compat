@@ -20,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Runtime half of a converted YSM model: the bone table (hierarchy, bind transforms,
@@ -65,31 +66,12 @@ public final class YSMRuntimeModel {
      */
     public final boolean tlmShowBackpack;
 
-    private final Map<UUID, YSMPlayerAnimator> animators = new ConcurrentHashMap<>();
+    private final AnimatorCache<LivingEntity, YSMPlayerAnimator> animators =
+            new AnimatorCache<>(() -> new YSMPlayerAnimator(this));
 
-    /**
-     * Last sweep-clock stamp each animator was used at, used to drop animators of
-     * entities that left the world / stopped being rendered, so a big model's
-     * per-player evaluator state (hundreds of KB for large models) does not
-     * accumulate for every entity that ever used it.
-     *
-     * The stamp is the level's game time ({@link #sweepClockOf}), NOT
-     * {@code entity.tickCount}: tickCount is per-entity (starts at 0 on spawn and
-     * resets on respawn / dimension change), so subtracting stamps taken from
-     * different entities compared unrelated clocks and deleted the still-live
-     * animators of every entity younger than the sweep trigger - once every 15 s
-     * per model, for every maid spawned after the sweeping one.
-     */
-    private final Map<UUID, Long> animatorLastTick = new ConcurrentHashMap<>();
-
-    /** Sweep cadence: scan at most every 15 s. */
-    private static final long ANIMATOR_SWEEP_INTERVAL_TICKS = 300;
-    /** Drop animators unused for more than 60 s. */
-    private static final long ANIMATOR_TTL_TICKS = 1200;
-    private static volatile long lastSweepTick = -1;
-    private static final java.util.concurrent.atomic.AtomicBoolean SWEEP_IN_PROGRESS = new java.util.concurrent.atomic.AtomicBoolean(false);
-    /** Fallback sweep clock for entities without a level (unload edge): monotonic, never 0. */
-    private static final java.util.concurrent.atomic.AtomicLong FALLBACK_TICK = new java.util.concurrent.atomic.AtomicLong(1);
+    private static final long ANIMATOR_SWEEP_INTERVAL_NANOS = TimeUnit.SECONDS.toNanos(15);
+    /** Guarded by CACHE. Null until the first sweep of this connection. */
+    private static Long lastAnimatorSweepAt;
 
     private YSMRuntimeModel(String modelId, BoneRt[] bones, Map<String, Integer> boneIndex,
                             List<CompiledAnim> parallels, Map<String, CompiledAnim> states,
@@ -106,70 +88,25 @@ public final class YSMRuntimeModel {
     }
 
     public YSMPlayerAnimator animatorFor(LivingEntity entity) {
-        UUID uuid = entity.getUUID();
-        long tick = sweepClockOf(entity);
-        animatorLastTick.put(uuid, tick);
-        YSMPlayerAnimator animator = animators.get(uuid);
-        if (animator == null) {
-            animator = new YSMPlayerAnimator(this);
-            animators.put(uuid, animator);
-        }
-        sweepIfDue(tick);
-        return animator;
+        return animators.get(entity.getUUID(), entity, entity.tickCount, System.nanoTime());
     }
 
-    /**
-     * Global monotonic sweep clock: the entity's level game time, which is the
-     * same for every entity rendered in a frame (the client only renders the
-     * current dimension). Per-entity {@code tickCount} values are not comparable
-     * across entities. A level-less entity (unloaded mid-frame) falls back to a
-     * monotonic local counter so its stamp is never mistaken for the epoch.
-     */
-    private static long sweepClockOf(LivingEntity entity) {
-        net.minecraft.world.level.Level level = entity.level();
-        return level != null ? level.getGameTime() : FALLBACK_TICK.incrementAndGet();
-    }
-
-    /** Periodically drop stale per-entity animators (see {@link #ANIMATOR_TTL_TICKS}). */
-    private static void sweepIfDue(long tick) {
-        long last = lastSweepTick;
-        if (tick - last < ANIMATOR_SWEEP_INTERVAL_TICKS) {
-            return;
-        }
-        if (!SWEEP_IN_PROGRESS.compareAndSet(false, true)) {
-            return;
-        }
-        try {
-            lastSweepTick = tick;
-            java.util.List<YSMRuntimeModel> models;
-            synchronized (CACHE) {
-                models = new ArrayList<>(CACHE.values());
+    /** Client tick maintenance also runs when no animated entity is in view. */
+    public static void sweepIdleAnimators() {
+        long now = System.nanoTime();
+        synchronized (CACHE) {
+            if (lastAnimatorSweepAt != null && now - lastAnimatorSweepAt < ANIMATOR_SWEEP_INTERVAL_NANOS) {
+                return;
             }
-            for (YSMRuntimeModel model : models) {
-                model.sweepAnimators(tick);
-            }
-        } finally {
-            SWEEP_IN_PROGRESS.set(false);
-        }
-    }
-
-    private void sweepAnimators(long nowTick) {
-        java.util.Iterator<Map.Entry<UUID, Long>> it = animatorLastTick.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<UUID, Long> entry = it.next();
-            if (nowTick - entry.getValue() > ANIMATOR_TTL_TICKS) {
-                it.remove();
-                animators.remove(entry.getKey());
-            }
+            lastAnimatorSweepAt = now;
+            for (YSMRuntimeModel model : CACHE.values()) model.animators.sweep(now);
         }
     }
 
     public static void clearAnimators() {
         synchronized (CACHE) {
-            for (YSMRuntimeModel model : CACHE.values()) {
-                model.animators.clear();
-                model.animatorLastTick.clear();
-            }
+            for (YSMRuntimeModel model : CACHE.values()) model.animators.clear();
+            lastAnimatorSweepAt = null;
         }
     }
 
